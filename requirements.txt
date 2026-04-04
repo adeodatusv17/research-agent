@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+sqlalchemy
+alembic
+pgvector
+psycopg[binary]
+python-dotenv
+pypdf
+pymupdf
+langgraph
+sentence-transformers
+python-multipart
+google-genai
+httpx
+pydantic
