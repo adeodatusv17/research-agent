@@ -11,12 +11,14 @@ def retrieve_subsections_node(state: dict) -> dict:
     paper_id = state["paper_id"]
     query_embedding = state["query_embedding"]
     section_names = [section["section_name"] for section in state.get("selected_sections", [])]
+    retrieval_parameters = state.get("retrieval_parameters", {})
 
     retrieved_subsections = semantic_retrieve_subsections(
         db,
         query_embedding,
         paper_id,
         section_names=section_names,
+        subsection_top_k=int(retrieval_parameters.get("subsection_top_k", 6)),
     )
 
     logger.info(
@@ -28,4 +30,5 @@ def retrieve_subsections_node(state: dict) -> dict:
     return {
         **state,
         "retrieved_subsections": retrieved_subsections,
+        "execution_trace": [*state.get("execution_trace", []), f"retrieve_subsections:{len(retrieved_subsections)}"],
     }

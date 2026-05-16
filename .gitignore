@@ -1,11 +1,15 @@
 # Local agent/editor state
 /.agent/
 /.codex/
+.vscode/
+.idea/
 
 # Secrets and local environment
-/.env
-/.env.*
+.env
+.env.*
 !.env.example
+*.pem
+*.key
 
 # Python
 __pycache__/
@@ -15,6 +19,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.coverage
+htmlcov/
 
 # Local databases and runtime artifacts
 /research_agent.db
@@ -22,12 +28,17 @@ venv/
 /artifacts/
 /uvicorn_*.txt
 *.log
+*.db
+*.sqlite
+*.sqlite3
 
 # Frontend build artifacts
 frontend/node_modules/
 frontend/.next/
 frontend/build-output.txt
 frontend/tsconfig.tsbuildinfo
+frontend/.vercel/
+coverage/
 
 # OS/editor noise
 .DS_Store

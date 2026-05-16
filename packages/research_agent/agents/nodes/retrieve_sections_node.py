@@ -9,15 +9,18 @@ logger = logging.getLogger(__name__)
 
 def retrieve_sections_node(state: dict) -> dict:
     db = state["db"]
-    query = state["query"]
+    query = state.get("active_query") or state["query"]
     paper_id = state["paper_id"]
     query_type = state.get("query_type", "method")
+    retrieval_parameters = state.get("retrieval_parameters", {})
     query_embedding = generate_embedding(query)
     selected_sections = semantic_retrieve_sections(
         db,
         query_embedding,
         paper_id,
         query_type=query_type,
+        include_references=bool(retrieval_parameters.get("include_references", False)),
+        section_top_k=int(retrieval_parameters.get("section_top_k", 3)),
     )
 
     logger.info(
@@ -32,4 +35,5 @@ def retrieve_sections_node(state: dict) -> dict:
         "query_embedding": query_embedding,
         "retrieved_sections": selected_sections,
         "selected_sections": selected_sections,
+        "execution_trace": [*state.get("execution_trace", []), f"retrieve_sections:{len(selected_sections)}"],
     }

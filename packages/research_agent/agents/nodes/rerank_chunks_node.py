@@ -7,10 +7,12 @@ logger = logging.getLogger(__name__)
 
 
 def rerank_chunks_node(state: dict) -> dict:
+    retrieval_parameters = state.get("retrieval_parameters", {})
     filtered_chunks = balanced_select_chunks(
         state.get("retrieved_chunks", []),
         selected_sections=state.get("selected_sections", []),
         query_intent=state.get("query_type", "method"),
+        top_k=int(retrieval_parameters.get("final_top_k", 12)),
     )
     retrieval_confidence = (
         sum(
@@ -43,4 +45,5 @@ def rerank_chunks_node(state: dict) -> dict:
         **state,
         "filtered_chunks": filtered_chunks,
         "retrieval_confidence": retrieval_confidence,
+        "execution_trace": [*state.get("execution_trace", []), f"rerank_chunks:{len(filtered_chunks)}"],
     }

@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -62,7 +63,7 @@ SECTION_RETRIEVAL_QUERIES = {
     "results": "evaluation benchmark metric performance comparison",
     "discussion": "limitation future work conclusion",
 }
-SECTION_AGENT_MAX_WORKERS = 2
+SECTION_AGENT_MAX_WORKERS = int(os.getenv("SECTION_AGENT_MAX_WORKERS", "1"))
 SECTION_AGENT_MAX_RETRIEVAL_ROUNDS = 1
 SECTION_AGENT_MAX_REWRITE_ROUNDS = 1
 SYNTHESIS_SYSTEM_PROMPT = """You are synthesizing pre-processed chunks from a research paper parsing pipeline.
@@ -505,51 +506,68 @@ def retrieve_additional_chunks(section_key: str, paper_id: uuid.UUID, existing_c
 
 
 def _run_evidence_assessment(section_key: str, section_chunks: list[dict]) -> dict:
-    section_guidance = {
-        "key_ideas": (
-            "Important: 'key_ideas' is a reader-facing executive summary, not a literal paper section. "
-            "Evidence may validly come from abstract, introduction, methods, results, or conclusion. "
-            "Do not treat a chunk as mismatched just because its section_name is 'method' or 'results'. "
-            "Instead assess whether the chunks collectively reveal the paper's problem, novelty, main contribution, "
-            "and high-level outcome."
-        ),
-        "discussion": (
-            "Important: 'discussion' may be absent as an explicit section in the paper. "
-            "If direct discussion/limitations chunks are missing, evidence from conclusion, future work, "
-            "ablation findings, or result caveats can still be sufficient to build a cautious discussion summary."
-        ),
-    }.get(section_key, "")
-    prompt = (
-        "You are evaluating whether a set of chunks provides sufficient and trustworthy evidence "
-        "to synthesize a section of a research paper summary.\n\n"
-        f"Section: {section_key}\n"
-        f"{section_guidance}\n\n"
-        "Chunks:\n"
-        f"{_format_section_chunks_for_prompt(section_chunks)}\n\n"
-        "Evaluate:\n"
-        "1. Sufficiency - is there enough content here to produce a meaningful summary of this section? "
-        "Consider number of chunks, coverage of expected content, and absence of critical information.\n"
-        "2. Trustworthiness - do the chunks appear coherent and consistent? Look for contradictions, "
-        "mistagged chunks, off-topic content, or very low confidence across all chunks.\n\n"
-        "Respond ONLY with JSON:\n"
-        '{'
-        '"sufficient": true, '
-        '"trustworthy": true, '
-        '"issues": ["issue 1"], '
-        '"retrieve_more": false, '
-        '"low_confidence_reason": null'
-        "}"
-    )
-    response = generate_json(prompt)
-    issues = response.get("issues") if isinstance(response.get("issues"), list) else []
+    issues: list[str] = []
+    if not section_chunks:
+        return {
+            "sufficient": False,
+            "trustworthy": False,
+            "issues": ["No evidence chunks available."],
+            "retrieve_more": True,
+            "low_confidence_reason": "No evidence chunks available.",
+        }
+
+    chunk_count = len(section_chunks)
+    avg_confidence = sum(float(chunk.get("confidence") or 0.0) for chunk in section_chunks) / chunk_count
+    avg_importance = sum(float(chunk.get("importance") or 0.0) for chunk in section_chunks) / chunk_count
+    unique_sections = {
+        _normalize_section_name(chunk.get("section_name")) or "unknown"
+        for chunk in section_chunks
+    }
+    text_blob = "\n".join(str(chunk.get("text") or chunk.get("content") or "") for chunk in section_chunks).lower()
+    contradiction_markers = ["however", "but", "although", "in contrast", "whereas", "limitation", "limitations"]
+    contradiction_hits = sum(text_blob.count(marker) for marker in contradiction_markers)
+
+    required_keywords = {
+        "key_ideas": ["propose", "novel", "contribution", "motivation", "outperform"],
+        "methods": ["model", "architecture", "algorithm", "module", "approach"],
+        "results": ["results", "benchmark", "metric", "accuracy", "evaluation"],
+        "discussion": ["limitation", "future work", "conclusion", "caveat", "discussion"],
+    }.get(section_key, [])
+    keyword_hits = sum(1 for keyword in required_keywords if keyword in text_blob)
+
+    sufficient = chunk_count >= 2 and avg_confidence >= 0.45 and avg_importance >= 0.25
+    if section_key == "results":
+        sufficient = sufficient and keyword_hits >= 1
+    elif section_key == "methods":
+        sufficient = sufficient and keyword_hits >= 1
+    elif section_key == "discussion":
+        sufficient = sufficient and (
+            keyword_hits >= 1
+            or "conclusion" in unique_sections
+            or "results" in unique_sections
+        )
+
+    trustworthy = avg_confidence >= 0.4 and contradiction_hits <= max(3, chunk_count * 2)
+    retrieve_more = (not sufficient or keyword_hits == 0) and chunk_count < 6
+
+    if chunk_count < 2:
+        issues.append("Too few evidence chunks for stable synthesis.")
+    if avg_confidence < 0.45:
+        issues.append("Average chunk confidence is low.")
+    if avg_importance < 0.25:
+        issues.append("Retrieved chunks are low-importance.")
+    if keyword_hits == 0 and required_keywords:
+        issues.append(f"Evidence lacks strong {section_key} cues.")
+    if contradiction_hits > max(3, chunk_count * 2):
+        issues.append("Evidence contains many contradiction or caveat markers.")
+
+    low_confidence_reason = "; ".join(issues) if issues else None
     return {
-        "sufficient": bool(response.get("sufficient")),
-        "trustworthy": bool(response.get("trustworthy")),
-        "issues": [str(issue).strip() for issue in issues if str(issue).strip()],
-        "retrieve_more": bool(response.get("retrieve_more")),
-        "low_confidence_reason": (
-            str(response.get("low_confidence_reason")).strip() if response.get("low_confidence_reason") else None
-        ),
+        "sufficient": sufficient,
+        "trustworthy": trustworthy,
+        "issues": issues,
+        "retrieve_more": retrieve_more,
+        "low_confidence_reason": low_confidence_reason,
     }
 
 

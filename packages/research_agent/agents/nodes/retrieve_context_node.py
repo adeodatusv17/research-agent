@@ -10,10 +10,13 @@ def retrieve_context_node(state: dict) -> dict:
     db = state["db"]
     paper_id = state["paper_id"]
     query_embedding = state["query_embedding"]
+    retrieval_parameters = state.get("retrieval_parameters", {})
     section_names = [section["section_name"] for section in state.get("selected_sections", [])]
     subsection_names = [
         subsection.get("subsection_name") for subsection in state.get("retrieved_subsections", [])
     ]
+    if retrieval_parameters.get("disable_subsection_filter"):
+        subsection_names = []
 
     retrieved_chunks = semantic_retrieve_chunks(
         db,
@@ -22,6 +25,7 @@ def retrieve_context_node(state: dict) -> dict:
         section_names=section_names or None,
         subsection_names=subsection_names or None,
         query_intent=state.get("query_type", "method"),
+        semantic_top_k=int(retrieval_parameters.get("semantic_top_k", 18)),
     )
 
     logger.info(
@@ -34,4 +38,5 @@ def retrieve_context_node(state: dict) -> dict:
     return {
         **state,
         "retrieved_chunks": retrieved_chunks,
+        "execution_trace": [*state.get("execution_trace", []), f"retrieve_context:{len(retrieved_chunks)}"],
     }
