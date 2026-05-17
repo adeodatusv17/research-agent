@@ -213,9 +213,17 @@ export interface QASource {
   score: number;
 }
 
+export interface AnswerTiers {
+  evidence_backed: string[];
+  inferred_from_evidence: string[];
+  general_background: string[];
+}
+
 export interface QAResponse {
+  request_id?: string;
   answer: string;
   sources: QASource[];
+  answer_tiers?: AnswerTiers;
 }
 
 export interface ChatMessage {

@@ -1,7 +1,7 @@
 import uuid
 
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from sqlalchemy.orm import Session
 
 from apps.api.dependencies import get_db
@@ -19,6 +19,12 @@ class QARequest(BaseModel):
 def ask_question(
     paper_id: uuid.UUID,
     payload: QARequest,
+    x_request_id: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    return answer_question(db, paper_id, payload.query)
+    request_id = x_request_id or str(uuid.uuid4())
+    response = answer_question(db, paper_id, payload.query, request_id=request_id)
+    return {
+        **response,
+        "request_id": request_id,
+    }

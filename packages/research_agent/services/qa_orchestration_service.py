@@ -5,6 +5,7 @@ from collections import Counter
 from typing import Iterable
 
 from research_agent.agents.state.qa_state import (
+    AnswerTiers,
     CritiqueReport,
     EvaluationReport,
     EvidenceDiagnostics,
@@ -94,6 +95,15 @@ CONTRADICTION_MARKERS = [
     "whereas",
 ]
 
+FORMULA_QUERY_KEYWORDS = [
+    "formula",
+    "formulas",
+    "equation",
+    "equations",
+    "mathematical expression",
+    "math expression",
+]
+
 
 def _append_trace(state: dict, event: str) -> list[str]:
     trace = list(state.get("execution_trace", []))
@@ -124,6 +134,38 @@ def _average(values: Iterable[float]) -> float:
     if not materialized:
         return 0.0
     return sum(materialized) / len(materialized)
+
+
+def _is_formula_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(keyword in lowered for keyword in FORMULA_QUERY_KEYWORDS)
+
+
+def _allows_general_background(query: str, diagnostics: EvidenceDiagnostics) -> bool:
+    lowered = query.lower()
+    explicit_background_markers = [
+        "what is",
+        "explain",
+        "overview",
+        "background",
+        "in general",
+        "generally",
+        "how does",
+    ]
+    if any(marker in lowered for marker in explicit_background_markers):
+        return True
+    if _is_formula_query(query):
+        return False
+    return float(diagnostics.get("retrieval_strength", 0.0)) < 0.35
+
+
+def _response_mode(query: str) -> str:
+    if _is_formula_query(query):
+        return "equation_extraction"
+    lowered = query.lower()
+    if any(marker in lowered for marker in ["list", "show", "provide", "give me", "which are", "what are"]):
+        return "literal_extraction"
+    return "standard"
 
 
 def _derive_required_evidence(query: str, query_type: str) -> list[str]:
@@ -541,6 +583,7 @@ def _claim_overlap_ratio(claim_text: str, supporting_chunks: list[dict]) -> floa
 
 def _derive_claim_grounding(
     claim_text: str,
+    tier: str,
     supporting_chunk_ids: list[str],
     chunk_lookup: dict[str, dict],
     diagnostics: EvidenceDiagnostics,
@@ -562,6 +605,7 @@ def _derive_claim_grounding(
     return {
         "claim_id": f"claim_{claim_index}",
         "claim_text": claim_text.strip(),
+        "tier": tier,
         "supporting_chunk_ids": [chunk["chunk_id"] for chunk in supporting_chunks if chunk.get("chunk_id")],
         "confidence": round(confidence, 4),
         "evidence_coverage": round(evidence_coverage, 4),
@@ -599,17 +643,68 @@ def _render_context(filtered_chunks: list[dict], max_tokens: int = 2200) -> tupl
     return "\n\n".join(parts), used_chunks
 
 
+def _normalize_answer_tiers(value: object) -> AnswerTiers:
+    if not isinstance(value, dict):
+        return {
+            "evidence_backed": [],
+            "inferred_from_evidence": [],
+            "general_background": [],
+        }
+
+    def normalize_list(key: str) -> list[str]:
+        entries = value.get(key)
+        if not isinstance(entries, list):
+            return []
+        return [str(item).strip() for item in entries if str(item).strip()]
+
+    return {
+        "evidence_backed": normalize_list("evidence_backed"),
+        "inferred_from_evidence": normalize_list("inferred_from_evidence"),
+        "general_background": normalize_list("general_background"),
+    }
+
+
+def _format_answer_from_tiers(answer_tiers: AnswerTiers) -> str:
+    sections: list[str] = []
+    labels = [
+        ("evidence_backed", "Supported by Paper"),
+        ("inferred_from_evidence", "Inferred From Paper Evidence"),
+        ("general_background", "General Background"),
+    ]
+    for key, label in labels:
+        entries = answer_tiers.get(key, [])
+        if not entries:
+            continue
+        sections.append(f"**{label}**")
+        sections.extend(f"- {entry}" for entry in entries)
+        sections.append("")
+    return "\n".join(section for section in sections if section is not None).strip()
+
+
 def generate_grounded_answer_step(state: dict) -> dict:
     filtered_chunks = list(state.get("filtered_chunks", []))
     diagnostics = state.get("evidence_diagnostics", {})
     context, used_chunks = _render_context(filtered_chunks)
     required_evidence = list((state.get("execution_plan") or {}).get("required_evidence", []))
+    allow_general_background = _allows_general_background(state["query"], diagnostics)
+    response_mode = _response_mode(state["query"])
     prompt = (
-        "Answer the research question using only the provided evidence.\n"
-        "Return JSON with keys: answer, claims.\n"
-        "claims must be a list of objects with keys: claim_text, supporting_chunk_ids.\n"
+        "Answer the research question using a 3-tier policy.\n"
+        "Return JSON with keys: answer_tiers, claims.\n"
+        "answer_tiers must contain exactly these keys:\n"
+        "- evidence_backed: list[str]\n"
+        "- inferred_from_evidence: list[str]\n"
+        "- general_background: list[str]\n"
+        "claims must be a list of objects with keys: claim_text, supporting_chunk_ids, tier.\n"
+        "tier must be either evidence_backed or inferred_from_evidence.\n"
         "Each claim must cite 1-3 chunk ids from the context. Do not invent chunk ids.\n"
-        "Keep claims atomic and evidence-grounded.\n"
+        "Do not put chunk-cited claims in general_background.\n"
+        "General background is allowed only when explicitly permitted below.\n"
+        f"General background allowed: {'yes' if allow_general_background else 'no'}.\n"
+        f"Response mode: {response_mode}.\n"
+        "If the question asks whether formulas/equations exist, do not stop at yes/no. "
+        "List the actual formulas or equation expressions visible in the evidence under evidence_backed whenever possible.\n"
+        "For extraction-style questions, prefer literal extraction over abstract summary.\n"
         f"Required evidence types: {required_evidence}\n\n"
         f"Question:\n{state['query']}\n\n"
         f"Context:\n{context}"
@@ -620,8 +715,9 @@ def generate_grounded_answer_step(state: dict) -> dict:
         logger.exception("qa_grounded_generation_failed paper_id=%s", state.get("paper_id"))
         answer_payload = {}
 
-    answer_text = str(answer_payload.get("answer") or "").strip()
+    answer_tiers = _normalize_answer_tiers(answer_payload.get("answer_tiers"))
     raw_claims = answer_payload.get("claims") if isinstance(answer_payload.get("claims"), list) else []
+    answer_text = _format_answer_from_tiers(answer_tiers)
     if not answer_text:
         answer_text = "Insufficient grounded evidence to produce a detailed answer."
     chunk_lookup = _build_chunk_lookup(used_chunks)
@@ -630,16 +726,18 @@ def generate_grounded_answer_step(state: dict) -> dict:
         if not isinstance(raw_claim, dict):
             continue
         claim_text = str(raw_claim.get("claim_text") or "").strip()
+        tier = str(raw_claim.get("tier") or "evidence_backed").strip()
         supporting_chunk_ids = [str(item) for item in (raw_claim.get("supporting_chunk_ids") or []) if str(item).strip()]
         if not claim_text:
             continue
         grounded_claims.append(
-            _derive_claim_grounding(claim_text, supporting_chunk_ids, chunk_lookup, diagnostics, index)
+            _derive_claim_grounding(claim_text, tier, supporting_chunk_ids, chunk_lookup, diagnostics, index)
         )
     if not grounded_claims and used_chunks:
         grounded_claims.append(
             _derive_claim_grounding(
                 answer_text,
+                "evidence_backed",
                 [str(used_chunks[0]["chunk_id"])],
                 chunk_lookup,
                 diagnostics,
@@ -674,6 +772,7 @@ def generate_grounded_answer_step(state: dict) -> dict:
         **state,
         "context": context,
         "answer": answer_text,
+        "answer_tiers": answer_tiers,
         "grounded_claims": grounded_claims,
         "final_confidence": final_confidence,
         "sources": sources,
@@ -866,7 +965,7 @@ def revise_answer_step(state: dict) -> dict:
         if not claim_text:
             continue
         revised_claims.append(
-            _derive_claim_grounding(claim_text, support_ids, chunk_lookup, diagnostics, index)
+            _derive_claim_grounding(claim_text, "inferred_from_evidence", support_ids, chunk_lookup, diagnostics, index)
         )
 
     answer = str(revision_payload.get("answer") or state.get("answer") or "").strip()
@@ -897,12 +996,22 @@ def evaluate_answer_step(state: dict) -> dict:
     verifier = state.get("verifier_report", {})
     critique = state.get("critic_report", {})
     plan = state.get("execution_plan", {})
+    grounded_claims = list(state.get("grounded_claims", []))
     required_count = max(1, len(plan.get("required_evidence", [])) if isinstance(plan, dict) else 1)
     completeness = _clip(
         1.0 - _safe_div(len(diagnostics.get("missing_required_fields", [])), required_count)
     )
+    supported_claim_ratio = verifier.get("supported_claim_ratio")
+    if supported_claim_ratio is None:
+        if grounded_claims:
+            supported_claim_ratio = _safe_div(
+                sum(1 for claim in grounded_claims if claim.get("support_status") == "supported"),
+                len(grounded_claims),
+            )
+        else:
+            supported_claim_ratio = 0.0
     grounding_quality = _clip(
-        0.6 * float(verifier.get("supported_claim_ratio", 0.0))
+        0.6 * float(supported_claim_ratio)
         + 0.4 * float(state.get("final_confidence", 0.0))
     )
     evidence_coverage = float(diagnostics.get("section_coverage", 0.0))
@@ -930,6 +1039,10 @@ def evaluate_answer_step(state: dict) -> dict:
         summary.append(f"Missing evidence: {', '.join(diagnostics['missing_required_fields'])}.")
     if verifier.get("issues"):
         summary.append(f"Verifier flagged {len(verifier['issues'])} issue(s).")
+    elif grounded_claims:
+        summary.append(
+            f"Claim support ratio from grounded claims: {round(float(supported_claim_ratio) * 100)}%."
+        )
     if not summary:
         summary.append("Grounding and evidence coverage are acceptable for the selected orchestration level.")
 

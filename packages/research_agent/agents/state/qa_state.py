@@ -56,12 +56,19 @@ class EvidenceDiagnostics(TypedDict, total=False):
 class GroundedClaim(TypedDict, total=False):
     claim_id: str
     claim_text: str
+    tier: str
     supporting_chunk_ids: list[str]
     confidence: float
     evidence_coverage: float
     contradiction_count: int
     support_strength: float
     support_status: str
+
+
+class AnswerTiers(TypedDict, total=False):
+    evidence_backed: list[str]
+    inferred_from_evidence: list[str]
+    general_background: list[str]
 
 
 class VerificationReport(TypedDict, total=False):
@@ -122,6 +129,7 @@ class QAState(TypedDict, total=False):
     evidence_diagnostics: EvidenceDiagnostics
     context: str
     answer: str
+    answer_tiers: AnswerTiers
     grounded_claims: list[GroundedClaim]
     final_confidence: float
     verifier_report: VerificationReport

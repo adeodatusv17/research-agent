@@ -116,6 +116,7 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
   async function handleSend() {
     const query = input.trim();
     if (!query || loading) return;
+    const requestId = crypto.randomUUID();
 
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -126,9 +127,16 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setLoading(true);
+    console.info("[qa] request_started", { paperId, requestId, query });
 
     try {
-      const data = await askQuestion(paperId, query);
+      const data = await askQuestion(paperId, query, { requestId });
+      console.info("[qa] request_completed", {
+        paperId,
+        requestId,
+        responseRequestId: data.request_id,
+        sourceCount: data.sources?.length ?? 0,
+      });
       const assistantMsg: ChatMessage = {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -138,6 +146,12 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
       };
       setMessages((prev) => [...prev, assistantMsg]);
     } catch (err: unknown) {
+      console.error("[qa] request_failed", {
+        paperId,
+        requestId,
+        error: err instanceof Error ? err.message : String(err),
+        rawError: err,
+      });
       toast.error(err instanceof Error ? err.message : "Failed to get answer");
       setMessages((prev) => prev.slice(0, -1));
       setInput(query);

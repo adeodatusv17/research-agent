@@ -4,6 +4,19 @@ This file tracks notable problems encountered during the project, along with obs
 
 ## 2026-05-16
 
+### QA showed `Internal Server Error` even when backend finished successfully
+
+- Symptom:
+  - browser logged `[qa] request_failed { error: 'Internal Server Error', ... }`
+  - backend logs for the same `request_id` later showed `qa_request_completed`
+  - affected requests were long-running QA calls around the 30s mark
+- Observed cause:
+  - frontend was sending requests through the Next.js `/api` rewrite proxy
+  - the proxy/client layer could fail before the FastAPI backend completed, creating a false frontend error
+- Mitigation:
+  - in local development, frontend now defaults to calling FastAPI directly at `http://localhost:8000`
+  - production still uses `/api` unless `NEXT_PUBLIC_API_BASE_URL` is set explicitly
+
 ### Gemini analysis pipeline hit `429 Too Many Requests`
 
 - Symptom:
@@ -39,3 +52,21 @@ This file tracks notable problems encountered during the project, along with obs
   - Windows path handling with spaces in the user directory
 - Mitigation:
   - use PowerShell conda hook + `conda activate research-agent` explicitly instead of `conda run`
+
+### Research QA grounding dilemma: retrieved evidence vs model prior knowledge
+
+- Symptom:
+  - retrieval can be only moderate while the generated answer still looks strong
+  - there is tension between strict grounding and allowing the model to fill gaps from prior knowledge
+- Observed cause:
+  - the system is optimized for research-paper QA, where paper-specific precision matters
+  - LLM prior knowledge can improve fluency and completeness, but may silently introduce unsupported details from similar papers or generic ML knowledge
+- Risk:
+  - mixing source-grounded claims with model priors without labeling them can create subtle hallucinations
+  - relying only on retrieved evidence can make answers incomplete when retrieval is weak
+- Follow-up:
+  - define an explicit 3-tier answer policy:
+    - evidence-backed
+    - inferred-from-evidence
+    - general background knowledge
+  - ensure future QA outputs can distinguish these categories instead of blending them invisibly

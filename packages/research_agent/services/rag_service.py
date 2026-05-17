@@ -1,5 +1,6 @@
 import logging
 import uuid
+from time import perf_counter
 
 from sqlalchemy.orm import Session
 
@@ -100,7 +101,21 @@ def generate_answer_from_chunks(
     }
 
 
-def answer_question(db: Session, paper_id: uuid.UUID, query: str) -> dict[str, object]:
+def answer_question(
+    db: Session,
+    paper_id: uuid.UUID,
+    query: str,
+    *,
+    request_id: str | None = None,
+) -> dict[str, object]:
+    effective_request_id = request_id or str(uuid.uuid4())
+    started_at = perf_counter()
+    logger.info(
+        "qa_request_started request_id=%s paper_id=%s query=%s",
+        effective_request_id,
+        paper_id,
+        query,
+    )
     # Skip the structured shortcut for code/implementation requests — it only returns
     # a brief summary like "Proposed: Conformer; Baselines: Transformer" which is not
     # useful when the user explicitly asks for code or a detailed explanation.
@@ -108,12 +123,13 @@ def answer_question(db: Session, paper_id: uuid.UUID, query: str) -> dict[str, o
         structured_answer = get_structured_answer_if_available(db, paper_id, query)
         if structured_answer is not None:
             logger.info(
-                "structured_analysis_shortcut paper_id=%s query=%s analysis_hits=%s",
+                "structured_analysis_shortcut request_id=%s paper_id=%s query=%s analysis_hits=%s",
+                effective_request_id,
                 paper_id,
                 query,
                 list(structured_answer.get("analysis_hits", {}).keys()),
             )
-            return {
+            payload = {
                 "answer": structured_answer["answer"],
                 "sources": structured_answer["sources"],
                 "orchestration_level": 0,
@@ -137,6 +153,11 @@ def answer_question(db: Session, paper_id: uuid.UUID, query: str) -> dict[str, o
                     "weak_signals": [],
                     "sufficient": True,
                     "should_retry": False,
+                },
+                "answer_tiers": {
+                    "evidence_backed": [structured_answer["answer"]],
+                    "inferred_from_evidence": [],
+                    "general_background": [],
                 },
                 "grounded_claims": [],
                 "retrieval_confidence": 1.0,
@@ -170,49 +191,66 @@ def answer_question(db: Session, paper_id: uuid.UUID, query: str) -> dict[str, o
                 "retrieval_attempts": [],
                 "execution_trace": ["structured_shortcut"],
             }
+            logger.info(
+                "qa_request_completed request_id=%s paper_id=%s orchestration_level=0 duration_ms=%s",
+                effective_request_id,
+                paper_id,
+                round((perf_counter() - started_at) * 1000, 2),
+            )
+            return payload
 
     from research_agent.agents.graphs.research_qa_graph import build_research_qa_graph
 
     graph = build_research_qa_graph()
-    final_state = graph.invoke(
-        {
-            "db": db,
-            "query": query,
-            "active_query": query,
-            "query_type": "",
-            "paper_id": paper_id,
-            "query_embedding": [],
-            "analysis_hits": {},
-            "orchestration_level": 1,
-            "should_plan": False,
-            "should_verify": False,
-            "should_critique": False,
-            "retry_budget": 0,
-            "revision_budget": 0,
-            "retry_count": 0,
-            "revision_count": 0,
-            "execution_plan": {},
-            "retrieval_parameters": {},
-            "retrieval_attempts": [],
-            "retrieved_sections": [],
-            "selected_sections": [],
-            "retrieved_subsections": [],
-            "retrieved_chunks": [],
-            "filtered_chunks": [],
-            "retrieval_confidence": 0.0,
-            "evidence_diagnostics": {},
-            "context": "",
-            "answer": "",
-            "grounded_claims": [],
-            "final_confidence": 0.0,
-            "verifier_report": {},
-            "critic_report": {},
-            "evaluation_report": {},
-            "sources": [],
-            "execution_trace": [],
-        }
-    )
-    return {
+    try:
+        final_state = graph.invoke(
+            {
+                "db": db,
+                "query": query,
+                "active_query": query,
+                "query_type": "",
+                "paper_id": paper_id,
+                "query_embedding": [],
+                "analysis_hits": {},
+                "orchestration_level": 1,
+                "should_plan": False,
+                "should_verify": False,
+                "should_critique": False,
+                "retry_budget": 0,
+                "revision_budget": 0,
+                "retry_count": 0,
+                "revision_count": 0,
+                "execution_plan": {},
+                "retrieval_parameters": {},
+                "retrieval_attempts": [],
+                "retrieved_sections": [],
+                "selected_sections": [],
+                "retrieved_subsections": [],
+                "retrieved_chunks": [],
+                "filtered_chunks": [],
+                "retrieval_confidence": 0.0,
+                "evidence_diagnostics": {},
+                "context": "",
+                "answer": "",
+                "answer_tiers": {},
+                "grounded_claims": [],
+                "final_confidence": 0.0,
+                "verifier_report": {},
+                "critic_report": {},
+                "evaluation_report": {},
+                "sources": [],
+                "execution_trace": [],
+            }
+        )
+    except Exception:
+        logger.exception(
+            "qa_request_failed request_id=%s paper_id=%s duration_ms=%s",
+            effective_request_id,
+            paper_id,
+            round((perf_counter() - started_at) * 1000, 2),
+        )
+        raise
+    payload = {
         "answer": final_state["answer"],
         "sources": final_state["sources"],
         "query_type": final_state.get("query_type"),
@@ -220,6 +258,7 @@ def answer_question(db: Session, paper_id: uuid.UUID, query: str) -> dict[str, o
         "execution_plan": final_state.get("execution_plan"),
         "retrieval_confidence": final_state.get("retrieval_confidence"),
         "evidence_diagnostics": final_state.get("evidence_diagnostics"),
+        "answer_tiers": final_state.get("answer_tiers"),
         "grounded_claims": final_state.get("grounded_claims"),
         "final_confidence": final_state.get("final_confidence"),
         "verifier_report": final_state.get("verifier_report"),
@@ -228,3 +267,13 @@ def answer_question(db: Session, paper_id: uuid.UUID, query: str) -> dict[str, o
         "retrieval_attempts": final_state.get("retrieval_attempts"),
         "execution_trace": final_state.get("execution_trace"),
     }
+    logger.info(
+        "qa_request_completed request_id=%s paper_id=%s orchestration_level=%s duration_ms=%s retrieval_confidence=%s final_confidence=%s",
+        effective_request_id,
+        paper_id,
+        final_state.get("orchestration_level"),
+        round((perf_counter() - started_at) * 1000, 2),
+        final_state.get("retrieval_confidence"),
+        final_state.get("final_confidence"),
+    )
+    return payload
