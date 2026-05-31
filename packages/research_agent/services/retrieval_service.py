@@ -520,7 +520,7 @@ def retrieve_relevant_chunks(
 ) -> dict[str, object]:
     query_type = classify_query(query)
     reference_query = is_reference_query(query)
-    query_embedding = generate_embedding(query)
+    query_embedding = generate_embedding(query, task="query")
 
     selected_sections = (
         semantic_retrieve_sections(

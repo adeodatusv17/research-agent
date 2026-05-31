@@ -5,6 +5,72 @@ from research_agent.tools.embedder import get_max_embed_tokens, get_tokenizer, n
 
 MAX_CHUNK_TOKENS = get_max_embed_tokens()
 CHUNK_OVERLAP_TOKENS = 50
+CLAIM_CONTINUATION_PREFIXES = (
+    "where ",
+    "where,",
+    "under ",
+    "for ",
+    "on ",
+    "when ",
+    "while ",
+    "with ",
+    "which ",
+    "this ",
+    "these ",
+    "it ",
+    "they ",
+    "we ",
+    "our ",
+    "such ",
+)
+EXPLANATION_HINTS = (
+    "denotes",
+    "represents",
+    "is defined as",
+    "is computed as",
+    "is the",
+    "refer to",
+    "corresponds to",
+    "objective",
+    "loss",
+)
+METRIC_HINTS = ("wer", "cer", "bleu", "rouge", "f1", "accuracy", "error rate", "latency")
+
+
+def _has_equation_signal(text: str) -> bool:
+    lowered = text.lower()
+    return "equation:" in lowered or text.count("=") >= 1 or "o(" in lowered
+
+
+def _should_merge_with_previous(previous: str, current: str) -> bool:
+    lowered_current = current.lower()
+    lowered_previous = previous.lower()
+    if lowered_current.startswith(CLAIM_CONTINUATION_PREFIXES):
+        return True
+    if _has_equation_signal(previous) and any(hint in lowered_current for hint in EXPLANATION_HINTS):
+        return True
+    if any(hint in lowered_previous for hint in ("result", "improves", "achieves", "outperforms")) and (
+        lowered_current.startswith(("under ", "on ", "for ", "with "))
+        or any(metric in lowered_current for metric in METRIC_HINTS)
+    ):
+        return True
+    return False
+
+
+def _merge_claim_units(units: list[str]) -> list[str]:
+    if not units:
+        return []
+    merged: list[str] = [units[0]]
+    for unit in units[1:]:
+        current = unit.strip()
+        if not current:
+            continue
+        previous = merged[-1]
+        if _should_merge_with_previous(previous, current):
+            merged[-1] = f"{previous} {current}".strip()
+        else:
+            merged.append(current)
+    return merged
 
 
 def _split_text_units(text: str) -> list[str]:
@@ -13,7 +79,10 @@ def _split_text_units(text: str) -> list[str]:
 
     for paragraph in paragraphs:
         if paragraph.startswith("TABLE:"):
-            units.append(paragraph)
+            table_lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+            if table_lines:
+                units.append(table_lines[0])
+                units.extend(table_lines[1:])
             continue
 
         lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
@@ -29,7 +98,7 @@ def _split_text_units(text: str) -> list[str]:
             ]
             units.extend(sentence_parts or [line])
 
-    return units
+    return _merge_claim_units(units)
 
 
 def split_text_into_chunks(text: str) -> list[dict[str, int | str]]:

@@ -4,7 +4,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, text
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,15 +13,56 @@ if str(PACKAGES_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGES_DIR))
 
 from research_agent.domain.models.paper import Paper
+from research_agent.domain.models.paper_analysis import PaperAnalysis
+from research_agent.domain.models.paper_chunk import PaperChunk
+from research_agent.domain.models.paper_repository import PaperRepository
+from research_agent.domain.models.paper_section import PaperSection
+from research_agent.domain.models.paper_subsection import PaperSubsection
+from research_agent.domain.models.reproducibility_score import ReproducibilityScore
 from research_agent.infrastructure.db.session import SessionLocal
 from research_agent.services.paper_analysis_service import analyze_paper
 from research_agent.services.paper_indexing_service import index_paper_document
+from research_agent.tools.embedder import get_embedding_dimension, get_embedding_model_name
 from research_agent.tools.pdf_parser import parse_pdf
 from research_agent.tools.pdf_text_extractor import extract_text_from_pdf
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def reset_all_derived_data() -> None:
+    with SessionLocal() as db:
+        logger.info("reset_all_derived_data_start embedding_model=%s", get_embedding_model_name())
+        db.execute(delete(ReproducibilityScore))
+        db.execute(delete(PaperRepository))
+        db.execute(delete(PaperAnalysis))
+        db.execute(delete(PaperChunk))
+        db.execute(delete(PaperSection))
+        db.execute(delete(PaperSubsection))
+        db.commit()
+        logger.info("reset_all_derived_data_complete")
+
+
+def migrate_embedding_dimensions() -> None:
+    embedding_dimension = get_embedding_dimension()
+    with SessionLocal() as db:
+        logger.info(
+            "migrate_embedding_dimensions_start embedding_model=%s embedding_dimension=%s",
+            get_embedding_model_name(),
+            embedding_dimension,
+        )
+        db.execute(
+            text(f"ALTER TABLE paper_chunks ALTER COLUMN embedding TYPE vector({embedding_dimension})")
+        )
+        db.execute(
+            text(f"ALTER TABLE paper_sections ALTER COLUMN embedding TYPE vector({embedding_dimension})")
+        )
+        db.execute(
+            text(f"ALTER TABLE paper_subsections ALTER COLUMN embedding TYPE vector({embedding_dimension})")
+        )
+        db.commit()
+        logger.info("migrate_embedding_dimensions_complete embedding_dimension=%s", embedding_dimension)
 
 
 def reanalyze_paper(paper_id: str) -> None:
@@ -76,19 +117,33 @@ def reanalyze_all() -> None:
     print(summary)
 
 
+def rebuild_all() -> None:
+    reset_all_derived_data()
+    migrate_embedding_dimensions()
+    reanalyze_all()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reanalyze papers after chunk quality updates.")
     parser.add_argument("--paper-id", help="Reanalyze a single paper by UUID.")
     parser.add_argument("--all", action="store_true", help="Reanalyze all papers.")
+    parser.add_argument(
+        "--rebuild-all",
+        action="store_true",
+        help="Delete all derived paper data, migrate embedding dimensions, and rebuild indices and analyses.",
+    )
     args = parser.parse_args()
 
     if args.paper_id:
         reanalyze_paper(args.paper_id)
         return
+    if args.rebuild_all:
+        rebuild_all()
+        return
     if args.all:
         reanalyze_all()
         return
-    parser.error("Provide --paper-id <uuid> or --all.")
+    parser.error("Provide --paper-id <uuid>, --all, or --rebuild-all.")
 
 
 if __name__ == "__main__":

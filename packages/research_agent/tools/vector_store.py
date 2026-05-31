@@ -164,6 +164,59 @@ def semantic_search(
     ]
 
 
+def fetch_neighbor_chunks(
+    db: Session,
+    *,
+    paper_id: uuid.UUID | str,
+    section_name: str | None,
+    subsection_name: str | None,
+    chunk_indexes: list[int],
+) -> list[dict]:
+    if not chunk_indexes:
+        return []
+    if isinstance(paper_id, str):
+        paper_id = uuid.UUID(paper_id)
+
+    statement = (
+        select(
+            PaperChunk.id,
+            PaperChunk.paper_id,
+            PaperChunk.chunk_index,
+            PaperChunk.section_name,
+            PaperChunk.subsection_name,
+            PaperChunk.content,
+        )
+        .where(
+            PaperChunk.paper_id == paper_id,
+            PaperChunk.chunk_index.in_(chunk_indexes),
+        )
+        .order_by(PaperChunk.chunk_index.asc())
+    )
+
+    if section_name is None:
+        statement = statement.where(PaperChunk.section_name.is_(None))
+    else:
+        statement = statement.where(PaperChunk.section_name == section_name)
+
+    if subsection_name is None:
+        statement = statement.where(PaperChunk.subsection_name.is_(None))
+    else:
+        statement = statement.where(PaperChunk.subsection_name == subsection_name)
+
+    rows = db.execute(statement).all()
+    return [
+        {
+            "chunk_id": str(row.id),
+            "paper_id": str(row.paper_id),
+            "chunk_index": int(row.chunk_index),
+            "section_name": row.section_name,
+            "subsection_name": row.subsection_name,
+            "content": row.content,
+        }
+        for row in rows
+    ]
+
+
 def semantic_search_sections(
     db: Session,
     query_embedding: list[float],

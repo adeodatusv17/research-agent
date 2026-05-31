@@ -461,7 +461,7 @@ def _merge_section_chunks(section_chunks: list[dict], additional_chunks: list[di
 def retrieve_additional_chunks(section_key: str, paper_id: uuid.UUID, existing_chunks: list[dict] | None = None) -> list[dict]:
     query = SECTION_RETRIEVAL_QUERIES.get(section_key, section_key)
     seen_ids = {str(chunk.get("id")) for chunk in (existing_chunks or []) if chunk.get("id")}
-    query_embedding = generate_embedding(query)
+    query_embedding = generate_embedding(query, task="query")
 
     with SessionLocal() as session:
         retrieved = semantic_search(

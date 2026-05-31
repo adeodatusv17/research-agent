@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from pgvector.sqlalchemy import Vector
 
 from research_agent.infrastructure.db.session import Base
+from research_agent.tools.embedder import get_embedding_dimension
 
 
 class PaperSubsection(Base):
@@ -21,5 +22,5 @@ class PaperSubsection(Base):
     page_number: Mapped[int | None] = mapped_column(Integer)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int | None] = mapped_column(Integer)
-    embedding: Mapped[list[float]] = mapped_column(Vector(384), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(get_embedding_dimension()), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

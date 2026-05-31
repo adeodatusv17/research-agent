@@ -29,15 +29,19 @@ SECTION_ALIASES = {
 }
 
 
+def _sanitize_text(value: str) -> str:
+    return value.replace("\x00", "")
+
+
 def _iter_document_lines(document: str | list[dict]) -> list[dict[str, str | int | None]]:
     if isinstance(document, str):
-        return [{"text": line.rstrip(), "page_number": None} for line in document.splitlines()]
+        return [{"text": _sanitize_text(line).rstrip(), "page_number": None} for line in document.splitlines()]
 
     lines: list[dict[str, str | int | None]] = []
     for page in document:
         page_number = int(page["page_number"])
         for block in page.get("blocks", []):
-            for line in str(block["text"]).splitlines():
+            for line in _sanitize_text(str(block["text"])).splitlines():
                 lines.append({"text": line.rstrip(), "page_number": page_number})
     return lines
 
@@ -97,7 +101,7 @@ def parse_sections(document: str | list[dict]) -> list[dict[str, str | int | Non
 
     def flush_buffer() -> None:
         nonlocal order, buffer, current_page_number
-        content = "\n".join(line for line in buffer if line.strip()).strip()
+        content = _sanitize_text("\n".join(line for line in buffer if line.strip()).strip())
         if not content:
             buffer = []
             return
@@ -148,9 +152,9 @@ def parse_sections(document: str | list[dict]) -> list[dict[str, str | int | Non
 
     if not sections:
         raw_text = (
-            document.strip()
+            _sanitize_text(document).strip()
             if isinstance(document, str)
-            else "\n".join(str(line["text"]) for line in lines).strip()
+            else _sanitize_text("\n".join(str(line["text"]) for line in lines)).strip()
         )
         if not raw_text:
             return []
@@ -181,11 +185,11 @@ def build_section_index_entries(
                 "section_heading": section.get("section_heading"),
                 "section_order": section.get("section_order", 0),
                 "page_number": section.get("page_number"),
-                "content": str(section["content"]),
+                "content": _sanitize_text(str(section["content"])),
             }
         else:
             merged[section_name]["content"] = (
-                f"{merged[section_name]['content']}\n\n{section['content']}".strip()
+                _sanitize_text(f"{merged[section_name]['content']}\n\n{section['content']}").strip()
             )
 
     return sorted(merged.values(), key=lambda section: int(section["section_order"]))
@@ -203,12 +207,12 @@ def build_subsection_index_entries(
                 "section_name": key[0],
                 "subsection_name": key[1],
                 "page_number": section.get("page_number"),
-                "content": str(section["content"]),
+                "content": _sanitize_text(str(section["content"])),
                 "section_order": section.get("section_order", 0),
             }
         else:
             merged[key]["content"] = (
-                f"{merged[key]['content']}\n\n{section['content']}".strip()
+                _sanitize_text(f"{merged[key]['content']}\n\n{section['content']}").strip()
             )
 
     return sorted(merged.values(), key=lambda subsection: int(subsection["section_order"]))

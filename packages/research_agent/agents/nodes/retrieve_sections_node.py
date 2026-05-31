@@ -13,7 +13,7 @@ def retrieve_sections_node(state: dict) -> dict:
     paper_id = state["paper_id"]
     query_type = state.get("query_type", "method")
     retrieval_parameters = state.get("retrieval_parameters", {})
-    query_embedding = generate_embedding(query)
+    query_embedding = generate_embedding(query, task="query")
     selected_sections = semantic_retrieve_sections(
         db,
         query_embedding,

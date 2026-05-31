@@ -19,6 +19,7 @@ from research_agent.agents.state.qa_state import (
 from research_agent.services.retrieval_service import classify_query
 from research_agent.tools.embedder import get_tokenizer
 from research_agent.tools.gemini_client import generate_json
+from research_agent.tools.vector_store import fetch_neighbor_chunks
 
 
 logger = logging.getLogger(__name__)
@@ -581,6 +582,97 @@ def _claim_overlap_ratio(claim_text: str, supporting_chunks: list[dict]) -> floa
     return _clip(_safe_div(overlap, len(claim_tokens)))
 
 
+def _has_metric_signal(text: str) -> bool:
+    lowered = text.lower()
+    metric_keywords = ("wer", "cer", "bleu", "rouge", "f1", "accuracy", "latency", "error rate", "perplexity")
+    if any(keyword in lowered for keyword in metric_keywords):
+        return True
+    return bool(re.search(r"\b\d+(?:\.\d+)?\s*%", text))
+
+
+def _should_expand_chunk_neighbors(chunk: dict) -> bool:
+    role = str(chunk.get("role") or "other")
+    content = str(chunk.get("content") or "")
+    if role in {"equation", "formula"}:
+        return True
+    if role == "evaluation" and _has_metric_signal(content):
+        return True
+    if role in {"method", "algorithm", "theory"} and len(_tokens(content)) <= 40:
+        lowered = content.lower()
+        return any(marker in lowered for marker in ("objective", "loss", "denotes", "represents", "defined as"))
+    return False
+
+
+def _neighbor_window(chunk: dict) -> tuple[int, int]:
+    role = str(chunk.get("role") or "other")
+    if role in {"equation", "formula"}:
+        return 1, 1
+    if role == "evaluation":
+        return 1, 1
+    return 0, 1
+
+
+def _expand_chunks_with_neighbors(db, filtered_chunks: list[dict]) -> list[dict]:
+    if db is None or not filtered_chunks:
+        return filtered_chunks
+
+    expanded_by_id: dict[str, dict] = {
+        str(chunk["chunk_id"]): dict(chunk)
+        for chunk in filtered_chunks
+        if chunk.get("chunk_id") is not None
+    }
+
+    for chunk in filtered_chunks:
+        if not _should_expand_chunk_neighbors(chunk):
+            continue
+        paper_id = chunk.get("paper_id")
+        chunk_id = chunk.get("chunk_id")
+        if not paper_id or chunk_id is None:
+            continue
+        before, after = _neighbor_window(chunk)
+        chunk_index = int(chunk.get("chunk_index") or 0)
+        target_indexes = [
+            chunk_index + offset
+            for offset in range(-before, after + 1)
+            if offset != 0 and chunk_index + offset >= 0
+        ]
+        neighbors = fetch_neighbor_chunks(
+            db,
+            paper_id=paper_id,
+            section_name=chunk.get("section_name"),
+            subsection_name=chunk.get("subsection_name"),
+            chunk_indexes=target_indexes,
+        )
+        for neighbor in neighbors:
+            neighbor_id = str(neighbor["chunk_id"])
+            if neighbor_id in expanded_by_id:
+                continue
+            expanded_by_id[neighbor_id] = {
+                **neighbor,
+                "score": chunk.get("score", 0.0),
+                "rerank_score": chunk.get("rerank_score", chunk.get("score", 0.0)),
+                "importance": max(0.2, float(chunk.get("importance", 0.0)) - 0.05),
+                "role": "neighbor_context",
+                "quality_score": chunk.get("quality_score", 0.0),
+                "neighbor_for_chunk_id": chunk_id,
+            }
+
+    expanded = list(expanded_by_id.values())
+    seed_rank = {
+        str(chunk["chunk_id"]): index
+        for index, chunk in enumerate(filtered_chunks)
+        if chunk.get("chunk_id") is not None
+    }
+    return sorted(
+        expanded,
+        key=lambda chunk: (
+            seed_rank.get(str(chunk.get("neighbor_for_chunk_id") or chunk.get("chunk_id")), len(filtered_chunks)),
+            str(chunk.get("section_name") or ""),
+            int(chunk.get("chunk_index") or 0),
+        ),
+    )
+
+
 def _derive_claim_grounding(
     claim_text: str,
     tier: str,
@@ -615,12 +707,13 @@ def _derive_claim_grounding(
     }
 
 
-def _render_context(filtered_chunks: list[dict], max_tokens: int = 2200) -> tuple[str, list[dict]]:
+def _render_context(db, filtered_chunks: list[dict], max_tokens: int = 2200) -> tuple[str, list[dict]]:
     tokenizer = get_tokenizer()
     current_tokens = 0
     parts: list[str] = []
     used_chunks: list[dict] = []
-    for chunk in filtered_chunks:
+    expanded_chunks = _expand_chunks_with_neighbors(db, filtered_chunks)
+    for chunk in expanded_chunks:
         part = (
             f"[Chunk {chunk['chunk_id']} | Section {chunk.get('section_name') or 'unknown'} | "
             f"Subsection {chunk.get('subsection_name') or 'none'} | score={float(chunk.get('score', 0.0)):.4f}]\n"
@@ -684,7 +777,7 @@ def _format_answer_from_tiers(answer_tiers: AnswerTiers) -> str:
 def generate_grounded_answer_step(state: dict) -> dict:
     filtered_chunks = list(state.get("filtered_chunks", []))
     diagnostics = state.get("evidence_diagnostics", {})
-    context, used_chunks = _render_context(filtered_chunks)
+    context, used_chunks = _render_context(state.get("db"), filtered_chunks)
     required_evidence = list((state.get("execution_plan") or {}).get("required_evidence", []))
     allow_general_background = _allows_general_background(state["query"], diagnostics)
     response_mode = _response_mode(state["query"])

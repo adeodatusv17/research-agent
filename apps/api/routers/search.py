@@ -11,6 +11,6 @@ router = APIRouter(prefix="/papers")
 
 @router.get("/search")
 def search_papers(query: str, db: Session = Depends(get_db)) -> dict[str, object]:
-    query_embedding = generate_embedding(query)
+    query_embedding = generate_embedding(query, task="query")
     results = semantic_search(db, query_embedding, top_k=20)
     return {"results": results}

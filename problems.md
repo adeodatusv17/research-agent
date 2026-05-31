@@ -17,6 +17,46 @@ This file tracks notable problems encountered during the project, along with obs
   - in local development, frontend now defaults to calling FastAPI directly at `http://localhost:8000`
   - production still uses `/api` unless `NEXT_PUBLIC_API_BASE_URL` is set explicitly
 
+### QA chunking can separate formulas, claims, and qualifiers from their explanations
+
+- Symptom:
+  - formula/equation questions may retrieve the equation line but miss the nearby explanation or variable definitions
+  - result/method questions can surface a core claim without its qualifier, scope condition, or follow-up sentence
+- Observed cause:
+  - chunking is section-aware and sentence-packed, but still mostly heuristic
+  - important adjacent evidence can land in neighboring chunks and not be passed forward together
+- Risk:
+  - answers sound incomplete even when the paper contains the needed detail nearby
+  - formula extraction questions may answer "yes" or show bare expressions without enough context
+- Planned fix:
+  - bundle equations with local explanatory context where possible
+  - add lightweight claim-aware sentence grouping
+  - pass neighboring chunks heuristically during QA context assembly for equation/result-heavy evidence
+
+### Short high-signal technical chunks may be filtered out too aggressively
+
+- Symptom:
+  - concise but important spans like objective definitions, theorem statements, formula lines, or short metric statements may be underrepresented
+- Observed cause:
+  - chunk sanitization and quality filtering prefer fuller sentence-like chunks with higher textual coherence
+- Risk:
+  - retrieval misses precisely the compact technical evidence users often ask for
+- Planned fix:
+  - loosen filtering for high-signal short technical chunks, especially formulas, objectives, theorem-like statements, and compact metric lines
+
+### Table-heavy evidence is still under-modeled for retrieval
+
+- Symptom:
+  - evaluation/result questions can miss useful evidence from tables or table-adjacent text
+  - numeric comparison evidence is often weaker than method/equation evidence
+- Observed cause:
+  - current quality scoring treats many table-like patterns as noise
+  - there is no dedicated compact result/table snippet extraction path yet
+- Risk:
+  - retrieval and QA underperform on benchmark, ablation, and metric-focused questions
+- Planned fix:
+  - improve table-aware preservation/extraction so metric rows, captions, and compact comparison snippets remain usable evidence
+
 ### Gemini analysis pipeline hit `429 Too Many Requests`
 
 - Symptom:

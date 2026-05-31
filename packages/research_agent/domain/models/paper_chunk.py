@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from pgvector.sqlalchemy import Vector
 
 from research_agent.infrastructure.db.session import Base
+from research_agent.tools.embedder import get_embedding_dimension
 
 
 class PaperChunk(Base):
@@ -20,4 +21,4 @@ class PaperChunk(Base):
     subsection_name: Mapped[str | None] = mapped_column(Text)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int | None] = mapped_column(Integer)
-    embedding: Mapped[list[float]] = mapped_column(Vector(384), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(get_embedding_dimension()), nullable=False)

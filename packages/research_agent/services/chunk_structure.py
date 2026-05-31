@@ -92,6 +92,20 @@ BANNED_SUMMARY_PATTERNS = (
     re.compile(r"\b1/2\s*x\b", re.IGNORECASE),
     re.compile(r"\bsubsampling\b", re.IGNORECASE),
 )
+METRIC_KEYWORDS = (
+    "wer",
+    "cer",
+    "bleu",
+    "rouge",
+    "f1",
+    "accuracy",
+    "error rate",
+    "latency",
+    "perplexity",
+    "precision",
+    "recall",
+    "map",
+)
 VERB_LIKE_RE = re.compile(
     r"\b("
     r"is|are|was|were|be|been|being|am|has|have|had|do|does|did|"
@@ -241,6 +255,52 @@ def _is_equation_or_diagram_heavy(text: str) -> bool:
     return False
 
 
+def _has_metric_signal(text: str) -> bool:
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in METRIC_KEYWORDS):
+        return True
+    if re.search(r"\b\d+(?:\.\d+)?\s*%", text):
+        return True
+    return bool(re.search(r"\b\d+(?:\.\d+)?\b", text) and ("table" in lowered or "figure" in lowered))
+
+
+def _extract_table_snippet(text: str) -> str | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    header = lines[0]
+    interesting: list[str] = []
+    for line in lines[1:]:
+        lowered = line.lower()
+        if any(keyword in lowered for keyword in METRIC_KEYWORDS) or re.search(r"\b\d+(?:\.\d+)?\s*%", line):
+            interesting.append(line)
+        elif re.search(r"\b(test|dev|baseline|ablation|ours|proposed)\b", lowered) and re.search(
+            r"\b\d+(?:\.\d+)?\b", line
+        ):
+            interesting.append(line)
+        if len(interesting) >= 4:
+            break
+    if not interesting:
+        return None
+    return _normalize_chunk_whitespace("\n".join([header, *interesting]))
+
+
+def _is_high_signal_short_chunk(text: str, role: str, confidence: float) -> bool:
+    stripped = text.strip()
+    word_count = _word_count(stripped)
+    if word_count == 0 or word_count > 40:
+        return False
+    if role in {"equation", "formula", "theory"} and ("=" in stripped or "[equation]" in stripped.lower()):
+        return confidence >= 0.35
+    if role == "evaluation" and _has_metric_signal(stripped):
+        return confidence >= 0.35
+    if role in {"method", "algorithm"} and any(
+        marker in stripped.lower() for marker in ("objective", "loss", "defined as", "denotes", "represents")
+    ):
+        return confidence >= 0.35
+    return False
+
+
 def _advance_to_sentence_boundary(text: str) -> str | None:
     if UPPER_OR_DIGIT_RE.match(text):
         return text
@@ -254,6 +314,11 @@ def _advance_to_sentence_boundary(text: str) -> str | None:
 def sanitize_chunk_content(content: str) -> str | None:
     cleaned = _normalize_chunk_whitespace(content)
     if not cleaned:
+        return None
+    if cleaned.lower().startswith("table:"):
+        table_snippet = _extract_table_snippet(content)
+        if table_snippet:
+            return table_snippet
         return None
     if _starts_with_banned_prefix(cleaned):
         return None
@@ -344,6 +409,8 @@ def is_quality_chunk(chunk: dict) -> bool:
 
     if confidence < 0.35:
         return False
+    if _is_high_signal_short_chunk(summary, role, confidence):
+        return True
     if role == "other":
         return False
     if len(summary) < 40:
@@ -393,6 +460,8 @@ def infer_chunk_role(content: str, section_name: str | None, subsection_name: st
     if _has_result_signal(content):
         role_scores["evaluation"] += 0.35
         role_scores["discussion"] += 0.1
+    if _has_metric_signal(content):
+        role_scores["evaluation"] += 0.45
 
     role, score = max(role_scores.items(), key=lambda item: item[1])
     sorted_scores = sorted(role_scores.values(), reverse=True)
@@ -490,7 +559,11 @@ def prepare_chunk_for_indexing(
         content=normalized_content,
         total_chunks=total_chunks,
     )
-    if not is_quality_chunk(prepared):
+    if not is_quality_chunk(prepared) and not _is_high_signal_short_chunk(
+        normalized_content,
+        prepared["role"],
+        prepared["confidence"],
+    ):
         return None
 
     return {
