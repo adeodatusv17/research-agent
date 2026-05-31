@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from collections.abc import Mapping, Sequence
+import unicodedata
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -276,9 +277,215 @@ def _normalize_equation_items(value) -> list[dict]:
                 "id": item.get("id"),
                 "chunk_index": item.get("chunk_index"),
                 "text": item.get("text"),
+                "quality_score": item.get("quality_score"),
+                "section_name": item.get("section_name"),
             }
         )
     return normalized
+
+
+def _extract_equation_items_from_section_text(text: str) -> list[dict]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    extracted: list[dict] = []
+    seen: set[str] = set()
+    assignment_pattern = re.compile(r"[A-Za-zΔ∆WBAqkvroαβσ_′'0-9][^.;\n]{0,40}=\s*[^.;\n]{2,140}")
+    banned_markers = (
+        "table ",
+        "learning rate",
+        "batch size",
+        "max seq",
+        "validation",
+        "accuracy",
+        "wikisql",
+        "mnli",
+        "sam sum",
+        "rouge",
+    )
+    def equation_signal_score(value: str) -> float:
+        lowered_value = value.lower()
+        score = 0.0
+        if "=" in value:
+            score += 2.0
+        if any(symbol in value for symbol in ("+", "Î”", "âˆ†", "Ã—", "*", "âˆˆ", "â‰ª", "â‰¤", "â‰¥", "/", "^")):
+            score += 1.0
+        if re.search(r"\b(?:w0|ba|ax|h)\b", lowered_value):
+            score += 1.5
+        if any(marker in lowered_value for marker in ("where ", "defined as", "denotes", "represents", "composition")):
+            score += 0.8
+        alpha_chars_local = len(re.sub(r"[^A-Za-zÎ”âˆ†Î±Î²Ïƒ]", "", value))
+        digit_chars_local = len(re.sub(r"\D", "", value))
+        if digit_chars_local and digit_chars_local > alpha_chars_local * 2:
+            score -= 1.2
+        if re.fullmatch(r"[A-Za-zÎ”âˆ†Î±Î²Ïƒ_'\s0-9]+", value):
+            score -= 0.6
+        return score
+
+    def add_candidate(candidate: str, description_window: str, bonus: float = 0.0) -> None:
+        normalized = unicodedata.normalize("NFKC", " ".join(candidate.split())).strip(" ,;:.")
+        if not normalized:
+            return
+        lowered_candidate = normalized.lower()
+        alpha_chars = len(re.sub(r"[^A-Za-zÎ”âˆ†Î±Î²Ïƒ]", "", normalized))
+        digit_chars = len(re.sub(r"\D", "", normalized))
+        if any(marker in lowered_candidate for marker in banned_markers):
+            return
+        if len(normalized) < 8 or alpha_chars < 2:
+            return
+        if digit_chars > alpha_chars * 3 and "=" in normalized:
+            return
+        quality_score = equation_signal_score(normalized) + bonus
+        if quality_score < 1.2:
+            return
+        if normalized.lower() in seen:
+            return
+        seen.add(normalized.lower())
+        extracted.append(
+            {
+                "latex": normalized,
+                "description": description_window[:220],
+                "text": description_window[:800],
+                "quality_score": round(quality_score, 4),
+            }
+        )
+    for index, line in enumerate(lines):
+        candidate_texts: list[str] = []
+        lowered = line.lower()
+        if "equation:" in lowered:
+            candidate_texts.append(re.sub(r"(?i)\bequation:\s*", "", line).strip())
+        candidate_texts.extend(match.strip() for match in assignment_pattern.findall(line))
+        for candidate in candidate_texts:
+            description_window = " ".join(lines[max(0, index - 1) : min(len(lines), index + 2)])
+            add_candidate(candidate, description_window)
+            continue
+            normalized = unicodedata.normalize("NFKC", " ".join(candidate.split())).strip(" ,;:.")
+            if not normalized:
+                continue
+            lowered_candidate = normalized.lower()
+            alpha_chars = len(re.sub(r"[^A-Za-zΔ∆αβσ]", "", normalized))
+            digit_chars = len(re.sub(r"\D", "", normalized))
+            if any(marker in lowered_candidate for marker in banned_markers):
+                continue
+            if len(normalized) < 8 or alpha_chars < 2:
+                continue
+            if digit_chars > alpha_chars * 3 and "=" in normalized:
+                continue
+            quality_score = equation_signal_score(normalized)
+            if quality_score < 1.2:
+                continue
+            if normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            description_window = " ".join(lines[max(0, index - 1) : min(len(lines), index + 2)])
+            extracted.append(
+                {
+                    "latex": normalized,
+                    "description": description_window[:220],
+                    "text": description_window[:800],
+                    "quality_score": round(quality_score, 4),
+                }
+            )
+    full_text = " ".join(lines)
+    targeted_patterns = [
+        r"(?:For\s+)?h\s*=\s*W0x[^.;\n]{0,80}BAx",
+        r"W0\s*\+[^.;\n]{0,24}W\s*=\s*W0\s*\+\s*BA[^.;\n]{0,140}",
+        r"store\s+W\s*=\s*W0\s*\+\s*BA[^.;\n]{0,120}",
+        r"\bBAx\b[^.;\n]{0,80}",
+        r"\bBA\b[^.;\n]{0,100}",
+    ]
+    for pattern in targeted_patterns:
+        for match in re.finditer(pattern, full_text, flags=re.IGNORECASE):
+            start = max(0, match.start() - 120)
+            end = min(len(full_text), match.end() + 120)
+            add_candidate(match.group(0), full_text[start:end], bonus=2.0)
+    normalized_items = _normalize_equation_items(extracted)
+    if not normalized_items:
+        return []
+    sorted_items = sorted(
+        normalized_items,
+        key=lambda item: (
+            float(item.get("quality_score") or 0.0),
+            1 if "=" in str(item.get("latex") or "") else 0,
+            len(str(item.get("latex") or "")),
+        ),
+        reverse=True,
+    )
+    best_score = float(sorted_items[0].get("quality_score") or 0.0)
+    kept: list[dict] = []
+    for item in sorted_items:
+        quality_score = float(item.get("quality_score") or 0.0)
+        if quality_score >= best_score - 1.25 or len(kept) < 3:
+            kept.append(item)
+        if len(kept) >= 8:
+            break
+    return kept
+
+
+def _extract_section_level_method_equations(db: Session, paper_id: uuid.UUID) -> list[dict]:
+    section_rows = (
+        db.query(PaperSection.section_name, PaperSection.content)
+        .filter(PaperSection.paper_id == paper_id)
+        .filter(PaperSection.section_name.in_(["introduction", "method"]))
+        .all()
+    )
+    extracted: list[dict] = []
+    for row in section_rows:
+        items = _extract_equation_items_from_section_text(str(row.content or ""))
+        section_name = str(row.section_name or "").strip().lower()
+        section_bonus = 0.45 if section_name == "method" else 0.2 if section_name == "introduction" else 0.0
+        for item in items:
+            item["section_name"] = row.section_name
+            item["quality_score"] = round(float(item.get("quality_score") or 0.0) + section_bonus, 4)
+        extracted.extend(items)
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for item in sorted(
+        extracted,
+        key=lambda entry: (
+            float(entry.get("quality_score") or 0.0),
+            1 if "=" in str(entry.get("latex") or "") else 0,
+            len(str(entry.get("latex") or "")),
+        ),
+        reverse=True,
+    ):
+        latex = str(item.get("latex") or "").strip().lower()
+        if not latex or latex in seen:
+            continue
+        seen.add(latex)
+        deduped.append(item)
+        if len(deduped) >= 8:
+            break
+    return deduped
+
+
+def get_extracted_method_equations(db: Session, paper_id: uuid.UUID) -> dict | None:
+    raw_section_items = _extract_section_level_method_equations(db, paper_id)
+    latest_analysis = (
+        db.query(PaperAnalysis)
+        .filter(PaperAnalysis.paper_id == paper_id)
+        .order_by(PaperAnalysis.created_at.desc())
+        .first()
+    )
+    if latest_analysis is None or not isinstance(latest_analysis.inferred_structure, Mapping):
+        return {"source": "extracted", "items": raw_section_items} if raw_section_items else None
+
+    methods_value = latest_analysis.inferred_structure.get("methods")
+    equations_value = methods_value.get("equations") if isinstance(methods_value, Mapping) else None
+    items = _normalize_equation_items(equations_value.get("items")) if isinstance(equations_value, Mapping) else []
+    combined_items: list[dict] = []
+    seen: set[str] = set()
+    for item in [*raw_section_items, *items]:
+        latex = str(item.get("latex") or "").strip().lower()
+        if not latex or latex in seen:
+            continue
+        seen.add(latex)
+        combined_items.append(item)
+    items = combined_items
+    if not items:
+        return None
+    return {
+        "source": "extracted",
+        "items": items,
+    }
 
 
 def _select_discussion_fallback_chunks(chunk_payloads: list[dict], *, max_items: int = 3) -> list[dict]:

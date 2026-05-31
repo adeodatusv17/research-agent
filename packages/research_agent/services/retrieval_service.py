@@ -84,6 +84,25 @@ SECTION_WEIGHTS = {
     "related_work": 0.7,
     "references": 0.05,
 }
+FORMULA_SECTION_HINTS = {
+    "method",
+    "methodology",
+    "theory",
+    "introduction",
+    "preliminaries",
+    "notation",
+    "approach",
+}
+FORMULA_SUBSECTION_KEYWORDS = [
+    "equation",
+    "formula",
+    "objective",
+    "loss",
+    "notation",
+    "parameterization",
+    "preliminar",
+    "derivation",
+]
 CITATION_PATTERNS = [
     r"\[[0-9,\s]+\]",
     r"et al\.",
@@ -197,6 +216,56 @@ def _role_match_weight(intent: str, role: str) -> float:
     return 0.0
 
 
+def _has_formula_signal(text: str) -> bool:
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in ("equation", "formula", "objective", "defined as", "denotes")):
+        return True
+    return bool(re.search(r"(=|\\[a-zA-Z]+|O\(|argmax|argmin)", text))
+
+
+def _formula_section_bonus(section_name: str | None) -> float:
+    normalized = _normalize_section_name(section_name)
+    if normalized in {"method", "theory"}:
+        return 1.0
+    if normalized in FORMULA_SECTION_HINTS:
+        return 0.6
+    if normalized in {"results", "discussion"}:
+        return 0.15
+    return 0.0
+
+
+def _formula_subsection_bonus(candidate: dict) -> float:
+    subsection_name = str(candidate.get("subsection_name") or "").lower()
+    content = str(candidate.get("content") or "")
+    bonus = 0.0
+    if any(keyword in subsection_name for keyword in FORMULA_SUBSECTION_KEYWORDS):
+        bonus += 0.8
+    if _has_formula_signal(content):
+        bonus += 0.6
+    return min(1.0, bonus)
+
+
+def _formula_candidate_bonus(candidate: dict) -> float:
+    role = str(candidate.get("role") or "other")
+    content = str(candidate.get("content") or "")
+    bonus = 0.0
+    if role in {"equation", "formula"}:
+        bonus += 1.0
+    elif role == "theory":
+        bonus += 0.8
+    elif role in {"method", "algorithm"}:
+        bonus += 0.35
+    if _has_formula_signal(content):
+        bonus += 0.45
+    if re.search(r"\b(?:w0|ba|ax|h)\b", content.lower()):
+        bonus += 0.35
+    if any(symbol in content for symbol in ("Δ", "∆", "∈", "×")):
+        bonus += 0.2
+    if any(marker in content.lower() for marker in ("defined as", "denotes", "represents", "objective", "loss")):
+        bonus += 0.25
+    return min(1.0, bonus)
+
+
 def _annotate_candidates(candidates: list[dict]) -> list[dict]:
     if not candidates:
         return []
@@ -230,11 +299,16 @@ def _annotate_candidates(candidates: list[dict]) -> list[dict]:
     return annotated
 
 
-def _filter_candidates(candidates: list[dict]) -> list[dict]:
+def _filter_candidates(candidates: list[dict], *, formula_mode: bool = False) -> list[dict]:
     if not candidates:
         return []
     annotated = _annotate_candidates(candidates)
-    quality_kept = [candidate for candidate in annotated if bool(candidate.get("quality_pass"))]
+    quality_kept = [
+        candidate
+        for candidate in annotated
+        if bool(candidate.get("quality_pass"))
+        or (formula_mode and _formula_candidate_bonus(candidate) >= 0.75)
+    ]
     if quality_kept:
         annotated = quality_kept
     kept: list[dict] = []
@@ -242,6 +316,9 @@ def _filter_candidates(candidates: list[dict]) -> list[dict]:
     for candidate in annotated:
         quality_score = float(candidate["quality_score"])
         semantic_score = float(candidate["score"])
+        if formula_mode and _formula_candidate_bonus(candidate) >= 0.75 and semantic_score >= best_score - 0.12:
+            kept.append(candidate)
+            continue
         if quality_score <= -1.0 and semantic_score < best_score - 0.01:
             continue
         if quality_score <= -0.5 and semantic_score < best_score - 0.01:
@@ -252,21 +329,23 @@ def _filter_candidates(candidates: list[dict]) -> list[dict]:
     return kept or annotated
 
 
-def _chunk_rerank_score(candidate: dict, query_intent: str) -> float:
+def _chunk_rerank_score(candidate: dict, query_intent: str, *, formula_mode: bool = False) -> float:
     cosine_similarity = float(candidate["score"])
     role_match_weight = _role_match_weight(query_intent, str(candidate.get("role") or "other"))
     importance = float(candidate.get("importance", 0.0))
     # NOTE: score ranges will remain low for papers ingested before the Fix 1
     # quality gate was deployed. Re-ingest affected papers using reanalyze_all().
-    return round(
+    base_score = (
         0.5 * cosine_similarity
         + 0.3 * role_match_weight
-        + 0.2 * importance,
-        4,
+        + 0.2 * importance
     )
+    if formula_mode:
+        base_score += 0.18 * _formula_candidate_bonus(candidate)
+    return round(base_score, 4)
 
 
-def _apply_rerank_scores(candidates: list[dict], query_intent: str) -> list[dict]:
+def _apply_rerank_scores(candidates: list[dict], query_intent: str, *, formula_mode: bool = False) -> list[dict]:
     scored: list[dict] = []
     for candidate in candidates:
         scored.append(
@@ -280,7 +359,7 @@ def _apply_rerank_scores(candidates: list[dict], query_intent: str) -> list[dict
                     _role_match_weight(query_intent, str(candidate.get("role") or "other")),
                     4,
                 ),
-                "rerank_score": _chunk_rerank_score(candidate, query_intent),
+                "rerank_score": _chunk_rerank_score(candidate, query_intent, formula_mode=formula_mode),
             }
         )
     return scored
@@ -322,6 +401,7 @@ def semantic_retrieve_sections(
     query_type: str = "method",
     include_references: bool = False,
     section_top_k: int = DEFAULT_SECTION_TOP_K,
+    formula_mode: bool = False,
 ) -> list[dict]:
     semantic_sections = semantic_search_sections(
         db,
@@ -329,7 +409,7 @@ def semantic_retrieve_sections(
         paper_id=paper_id,
         top_k=max(section_top_k * 4, DEFAULT_SECTION_TOP_K),
     )
-    filtered_sections = _filter_candidates(semantic_sections)
+    filtered_sections = _filter_candidates(semantic_sections, formula_mode=formula_mode)
     weighted_sections = sorted(
         [
             section
@@ -338,7 +418,9 @@ def semantic_retrieve_sections(
             or _normalize_section_name(section["section_name"]) != "references"
         ],
         key=lambda section: (
-            0.7 * section["score"] + 0.3 * _section_prior(query_type, section["section_name"]),
+            0.7 * section["score"]
+            + 0.3 * _section_prior(query_type, section["section_name"])
+            + (0.18 * _formula_section_bonus(section["section_name"]) if formula_mode else 0.0),
             section.get("quality_score", 0.0),
             _section_weight(section["section_name"]),
             -section["section_order"],
@@ -364,6 +446,7 @@ def semantic_retrieve_subsections(
     paper_id: uuid.UUID,
     section_names: list[str],
     subsection_top_k: int = DEFAULT_SUBSECTION_TOP_K,
+    formula_mode: bool = False,
 ) -> list[dict]:
     subsection_results = semantic_search_subsections(
         db,
@@ -372,7 +455,7 @@ def semantic_retrieve_subsections(
         section_names=section_names,
         top_k=max(subsection_top_k * 4, DEFAULT_SUBSECTION_TOP_K),
     )
-    subsection_results = _filter_candidates(subsection_results)
+    subsection_results = _filter_candidates(subsection_results, formula_mode=formula_mode)
     grouped: dict[str, list[dict]] = defaultdict(list)
     for subsection in subsection_results:
         grouped[subsection.get("section_name") or "unknown"].append(subsection)
@@ -384,7 +467,8 @@ def semantic_retrieve_subsections(
         ranked = sorted(
             grouped.get(section_name, []),
             key=lambda subsection: (
-                subsection["score"] * _section_weight(subsection["section_name"]),
+                subsection["score"] * _section_weight(subsection["section_name"])
+                + (0.16 * _formula_subsection_bonus(subsection) if formula_mode else 0.0),
                 subsection.get("quality_score", 0.0),
                 -(subsection["page_number"] or 10**6),
             ),
@@ -397,7 +481,8 @@ def semantic_retrieve_subsections(
         remainder = sorted(
             subsection_results,
             key=lambda subsection: (
-                subsection["score"] * _section_weight(subsection["section_name"]),
+                subsection["score"] * _section_weight(subsection["section_name"])
+                + (0.16 * _formula_subsection_bonus(subsection) if formula_mode else 0.0),
                 subsection.get("quality_score", 0.0),
                 -(subsection["page_number"] or 10**6),
             ),
@@ -416,6 +501,8 @@ def semantic_retrieve_chunks(
     subsection_names: list[str | None] | None = None,
     query_intent: str = "method",
     semantic_top_k: int = DEFAULT_CHUNK_TOP_K,
+    formula_mode: bool = False,
+    debug_query: str | None = None,
 ) -> list[dict]:
     chunk_results = semantic_search(
         db,
@@ -425,8 +512,24 @@ def semantic_retrieve_chunks(
         subsection_names=subsection_names,
         top_k=max(semantic_top_k * 4, 40),
     )
-    filtered_chunks = _filter_candidates(chunk_results)
-    scored_chunks = _apply_rerank_scores(filtered_chunks, query_intent)
+    if formula_mode:
+        logger.info(
+            "qa_formula_retrieval_raw query=%s query_intent=%s retrieved_top_20=%s",
+            debug_query,
+            query_intent,
+            [
+                {
+                    "chunk_id": chunk.get("chunk_id"),
+                    "section": chunk.get("section_name"),
+                    "subsection": chunk.get("subsection_name"),
+                    "score": round(float(chunk.get("score", 0.0)), 4),
+                    "content": str(chunk.get("content") or "")[:220],
+                }
+                for chunk in chunk_results[:20]
+            ],
+        )
+    filtered_chunks = _filter_candidates(chunk_results, formula_mode=formula_mode)
+    scored_chunks = _apply_rerank_scores(filtered_chunks, query_intent, formula_mode=formula_mode)
     ranked_chunks = sorted(
         scored_chunks,
         key=lambda chunk: (
@@ -437,6 +540,24 @@ def semantic_retrieve_chunks(
         ),
         reverse=True,
     )
+    if formula_mode:
+        logger.info(
+            "qa_formula_retrieval_reranked query=%s query_intent=%s reranked_top_20=%s",
+            debug_query,
+            query_intent,
+            [
+                {
+                    "chunk_id": chunk.get("chunk_id"),
+                    "section": chunk.get("section_name"),
+                    "subsection": chunk.get("subsection_name"),
+                    "score": round(float(chunk.get("score", 0.0)), 4),
+                    "rerank_score": round(float(chunk.get("rerank_score", chunk.get("score", 0.0))), 4),
+                    "role": chunk.get("role"),
+                    "content": str(chunk.get("content") or "")[:220],
+                }
+                for chunk in ranked_chunks[:20]
+            ],
+        )
     return ranked_chunks[: max(semantic_top_k * 2, semantic_top_k)]
 
 
@@ -444,11 +565,12 @@ def rerank_chunks(
     chunks: list[dict],
     top_k: int = DEFAULT_FINAL_TOP_K,
     query_intent: str = "method",
+    formula_mode: bool = False,
 ) -> list[dict]:
-    annotated = _filter_candidates(chunks)
+    annotated = _filter_candidates(chunks, formula_mode=formula_mode)
     if not annotated:
         return []
-    scored = _apply_rerank_scores(annotated, query_intent)
+    scored = _apply_rerank_scores(annotated, query_intent, formula_mode=formula_mode)
     ranked = sorted(
         scored,
         key=lambda chunk: (
@@ -468,6 +590,7 @@ def balanced_select_chunks(
     query_intent: str = "method",
     top_k: int = DEFAULT_FINAL_TOP_K,
     chunks_per_section: int = CHUNKS_PER_SECTION,
+    formula_mode: bool = False,
 ) -> list[dict]:
     grouped: dict[str, list[dict]] = defaultdict(list)
     for chunk in chunks:
@@ -478,6 +601,7 @@ def balanced_select_chunks(
             grouped[section_name],
             top_k=chunks_per_section,
             query_intent=query_intent,
+            formula_mode=formula_mode,
         )
 
     merged: list[dict] = []
@@ -499,14 +623,14 @@ def balanced_select_chunks(
         seen_ids = {chunk["chunk_id"] for chunk in merged}
         remainder = [
             chunk
-            for chunk in rerank_chunks(chunks, top_k=len(chunks), query_intent=query_intent)
+            for chunk in rerank_chunks(chunks, top_k=len(chunks), query_intent=query_intent, formula_mode=formula_mode)
             if chunk["chunk_id"] not in seen_ids
             and float(chunk.get("quality_score", 0.0)) > -0.1
             and float(chunk.get("importance", 0.0)) > 0.1
         ]
         merged.extend(remainder)
 
-    return rerank_chunks(merged, top_k=top_k, query_intent=query_intent)
+    return rerank_chunks(merged, top_k=top_k, query_intent=query_intent, formula_mode=formula_mode)
 
 
 def retrieve_relevant_chunks(
@@ -517,6 +641,7 @@ def retrieve_relevant_chunks(
     section_top_k: int = DEFAULT_SECTION_TOP_K,
     subsection_top_k: int = DEFAULT_SUBSECTION_TOP_K,
     semantic_top_k: int = DEFAULT_CHUNK_TOP_K,
+    formula_mode: bool = False,
 ) -> dict[str, object]:
     query_type = classify_query(query)
     reference_query = is_reference_query(query)
@@ -530,6 +655,7 @@ def retrieve_relevant_chunks(
             query_type=query_type,
             include_references=reference_query,
             section_top_k=section_top_k,
+            formula_mode=formula_mode,
         )
         if paper_id is not None
         else []
@@ -543,6 +669,7 @@ def retrieve_relevant_chunks(
             paper_id,
             section_names=section_names,
             subsection_top_k=subsection_top_k,
+            formula_mode=formula_mode,
         )
         if paper_id is not None and section_names
         else []
@@ -559,6 +686,7 @@ def retrieve_relevant_chunks(
         subsection_names=subsection_names,
         query_intent=query_type,
         semantic_top_k=semantic_top_k,
+        formula_mode=formula_mode,
     )
     selected_chunks = balanced_select_chunks(
         semantic_results,
@@ -566,6 +694,7 @@ def retrieve_relevant_chunks(
         query_intent=query_type,
         top_k=top_k,
         chunks_per_section=CHUNKS_PER_SECTION,
+        formula_mode=formula_mode,
     )
     retrieval_confidence = (
         sum(float(chunk["score"]) for chunk in selected_chunks) / len(selected_chunks)

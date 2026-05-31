@@ -13,6 +13,7 @@ router = APIRouter(prefix="/papers")
 
 class QARequest(BaseModel):
     query: str
+    recent_turns: list[dict[str, str]] | None = None
 
 
 @router.post("/{paper_id}/qa")
@@ -23,7 +24,13 @@ def ask_question(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     request_id = x_request_id or str(uuid.uuid4())
-    response = answer_question(db, paper_id, payload.query, request_id=request_id)
+    response = answer_question(
+        db,
+        paper_id,
+        payload.query,
+        recent_turns=payload.recent_turns,
+        request_id=request_id,
+    )
     return {
         **response,
         "request_id": request_id,

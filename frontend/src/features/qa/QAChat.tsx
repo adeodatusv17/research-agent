@@ -1,13 +1,14 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
-import { Send, User, Bot, BookOpen, ChevronDown, ChevronUp, Loader2, Copy, Check } from "lucide-react";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { Send, User, Bot, BookOpen, ChevronDown, ChevronUp, Loader2, Copy, Check, Sigma } from "lucide-react";
+import katex from "katex";
 import ReactMarkdown from "react-markdown";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import clsx from "clsx";
 import { askQuestion } from "@/lib/api-client";
-import type { ChatMessage, PaperDomain, QASource } from "@/lib/types";
+import type { ChatMessage, ConversationTurn, EquationCollection, PaperDomain, QASource } from "@/lib/types";
 import toast from "react-hot-toast";
 
 interface QAChatProps {
@@ -87,6 +88,102 @@ function CodeBlock({ inline, className, children, ...props }: any) {
   );
 }
 
+function splitEquationSteps(latex: string): string[] {
+  const cleaned = latex.replace(/\s+/g, " ").trim();
+  if (!cleaned) {
+    return [];
+  }
+  const pieces = cleaned
+    .split(/(?=(?:[A-Za-zxy~Ëœ][A-Za-z0-9Ëœâ€²'`\s]{0,14})\s*=)/g)
+    .map((part) => part.replace(/^\(\d+\)\s*/, "").trim())
+    .filter(Boolean);
+  if (pieces.length <= 1) {
+    return [cleaned];
+  }
+  return pieces.filter((part) => /=/.test(part));
+}
+
+function renderEquationLatex(latex: string): string {
+  try {
+    return katex.renderToString(latex, {
+      throwOnError: false,
+      displayMode: true,
+    });
+  } catch {
+    return katex.renderToString(`\\text{${latex.replace(/[{}]/g, "")}}`, {
+      throwOnError: false,
+      displayMode: true,
+    });
+  }
+}
+
+function EquationBlock({
+  latex,
+  description,
+}: {
+  latex: string;
+  description: string;
+}) {
+  const equationSteps = useMemo(() => splitEquationSteps(latex), [latex]);
+  const renderedEquations = useMemo(
+    () => equationSteps.map((step) => renderEquationLatex(step)),
+    [equationSteps]
+  );
+
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/20 p-4">
+      <div className="rounded-lg border border-white/10 bg-black/30 p-4">
+        <div className="space-y-3">
+          {renderedEquations.map((equation, index) => (
+            <div key={`${equationSteps[index]}-${index}`} className="overflow-x-auto text-white">
+              {renderedEquations.length > 1 && (
+                <p className="mb-2 text-[11px] font-medium uppercase tracking-[0.14em] text-gray-500">
+                  Step {index + 1}
+                </p>
+              )}
+              <div dangerouslySetInnerHTML={{ __html: equation }} />
+            </div>
+          ))}
+        </div>
+      </div>
+      {description && (
+        <div className="mt-3 rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2">
+          <p className="text-sm leading-relaxed text-gray-400">{description}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EquationPanel({ equations }: { equations: EquationCollection | null | undefined }) {
+  const equationItems = equations?.items?.filter((item) => (item.latex ?? "").trim().length > 0) ?? [];
+  if (equationItems.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mb-4 rounded-xl border border-white/10 bg-bg-hover/40 p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm text-gray-300">
+        <Sigma className="h-4 w-4" />
+        <span>Equations from the paper</span>
+      </div>
+      {equations?.source === "llm_generated" && (
+        <div className="mb-4 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-200">
+          These equations were inferred by AI because no direct equations were extracted. Verify against the original paper.
+        </div>
+      )}
+      <div className="space-y-4">
+        {equationItems.map((item, index) => (
+          <EquationBlock
+            key={item.id ?? `qa-equation-${index}`}
+            latex={(item.latex ?? "").trim()}
+            description={(item.description ?? "").trim()}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function QAChat({ paperId, domain }: QAChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -113,10 +210,21 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
     setInput?.(prompt);
   }
 
+  function buildRecentTurns(history: ChatMessage[]): ConversationTurn[] {
+    return history
+      .slice(-4)
+      .map((message) => ({
+        role: message.role,
+        content: message.content,
+      }))
+      .filter((turn) => turn.content.trim().length > 0);
+  }
+
   async function handleSend() {
     const query = input.trim();
     if (!query || loading) return;
     const requestId = crypto.randomUUID();
+    const recentTurns = buildRecentTurns(messages);
 
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -130,7 +238,7 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
     console.info("[qa] request_started", { paperId, requestId, query });
 
     try {
-      const data = await askQuestion(paperId, query, { requestId });
+      const data = await askQuestion(paperId, query, { requestId }, recentTurns);
       console.info("[qa] request_completed", {
         paperId,
         requestId,
@@ -142,6 +250,7 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
         role: "assistant",
         content: data.answer,
         sources: data.sources,
+        equations: data.equations,
         timestamp: Date.now(),
       };
       setMessages((prev) => [...prev, assistantMsg]);
@@ -208,6 +317,7 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
               >
                 {msg.role === "assistant" ? (
                   <div className="prose prose-invert max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent prose-headings:text-text-primary prose-a:text-text-primary prose-strong:text-text-primary">
+                    <EquationPanel equations={msg.equations} />
                     <ReactMarkdown components={{ code: CodeBlock as any }}>{msg.content}</ReactMarkdown>
                   </div>
                 ) : (

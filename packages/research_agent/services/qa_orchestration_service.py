@@ -2,7 +2,7 @@ import logging
 import math
 import re
 from collections import Counter
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from research_agent.agents.state.qa_state import (
     AnswerTiers,
@@ -17,6 +17,7 @@ from research_agent.agents.state.qa_state import (
     VerificationReport,
 )
 from research_agent.services.retrieval_service import classify_query
+from research_agent.services.paper_analysis_service import get_extracted_method_equations
 from research_agent.tools.embedder import get_tokenizer
 from research_agent.tools.gemini_client import generate_json
 from research_agent.tools.vector_store import fetch_neighbor_chunks
@@ -103,6 +104,41 @@ FORMULA_QUERY_KEYWORDS = [
     "equations",
     "mathematical expression",
     "math expression",
+    "mathematical formulation",
+    "objective function",
+    "notation",
+    "derivation",
+]
+
+FORMULA_QUERY_EXPANSION_TERMS = (
+    "equation",
+    "formula",
+    "mathematical formulation",
+    "objective",
+    "notation",
+)
+
+FOLLOW_UP_STARTERS = (
+    "it",
+    "they",
+    "them",
+    "that",
+    "this",
+    "those",
+    "these",
+    "he",
+    "she",
+    "there",
+)
+
+FOLLOW_UP_PATTERNS = [
+    r"^(?:what|which|where|why|how)\s+(?:is|are|does|did|do|was|were)\s+(?:it|they|that|this|those|these)\b",
+    r"^(?:what|which)\s+(?:equation|formula|expression)\b",
+    r"^(?:what's|whats)\s+(?:the\s+)?(?:equation|formula|mathematical expression)\b",
+    r"^where does the paper say that\b",
+    r"^why did you say\b",
+    r"^how does it work\b",
+    r"^what about\b",
 ]
 
 
@@ -126,6 +162,13 @@ def _normalize_text(value: str) -> str:
     return " ".join(value.lower().split())
 
 
+def _truncate_text(value: str, max_chars: int = 280) -> str:
+    cleaned = " ".join(value.split()).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
+
+
 def _tokens(text: str) -> list[str]:
     return [token for token in re.findall(r"\b[a-zA-Z0-9]+\b", text.lower()) if token not in STOPWORDS]
 
@@ -140,6 +183,77 @@ def _average(values: Iterable[float]) -> float:
 def _is_formula_query(query: str) -> bool:
     lowered = query.lower()
     return any(keyword in lowered for keyword in FORMULA_QUERY_KEYWORDS)
+
+
+def _normalize_recent_turns(turns: object) -> list[dict[str, str]]:
+    if not isinstance(turns, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for turn in turns[-6:]:
+        if not isinstance(turn, Mapping):
+            continue
+        role = str(turn.get("role") or "").strip().lower()
+        content = _truncate_text(str(turn.get("content") or "").strip(), max_chars=420)
+        if role not in {"user", "assistant"} or not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def _is_follow_up_query(query: str) -> bool:
+    cleaned = _normalize_text(query)
+    if not cleaned:
+        return False
+    if any(re.match(pattern, cleaned) for pattern in FOLLOW_UP_PATTERNS):
+        return True
+    tokens = cleaned.split()
+    if tokens and tokens[0] in FOLLOW_UP_STARTERS:
+        return True
+    if len(tokens) <= 7 and any(token in {"it", "that", "this", "they", "them"} for token in tokens):
+        return True
+    return False
+
+
+def resolve_conversational_query(query: str, recent_turns: object) -> dict[str, object]:
+    normalized_turns = _normalize_recent_turns(recent_turns)
+    cleaned_query = " ".join(query.split()).strip()
+    if not cleaned_query or not normalized_turns or not _is_follow_up_query(cleaned_query):
+        return {
+            "rewritten_query": cleaned_query,
+            "is_follow_up": False,
+            "reason": None,
+        }
+
+    previous_user = next(
+        (turn["content"] for turn in reversed(normalized_turns) if turn.get("role") == "user"),
+        "",
+    )
+    previous_assistant = next(
+        (turn["content"] for turn in reversed(normalized_turns) if turn.get("role") == "assistant"),
+        "",
+    )
+    if not previous_user and not previous_assistant:
+        return {
+            "rewritten_query": cleaned_query,
+            "is_follow_up": False,
+            "reason": None,
+        }
+
+    parts: list[str] = []
+    if previous_user:
+        parts.append(f"Previous question: {previous_user}")
+    lowered_query = cleaned_query.lower()
+    if previous_assistant and any(
+        marker in lowered_query
+        for marker in ("that", "there", "before", "say that", "why did you say", "where does the paper say")
+    ):
+        parts.append(f"Referenced answer: {_truncate_text(previous_assistant, max_chars=240)}")
+    parts.append(f"Follow-up question: {cleaned_query}")
+    return {
+        "rewritten_query": " | ".join(parts),
+        "is_follow_up": True,
+        "reason": "recent_turn_context",
+    }
 
 
 def _allows_general_background(query: str, diagnostics: EvidenceDiagnostics) -> bool:
@@ -167,6 +281,17 @@ def _response_mode(query: str) -> str:
     if any(marker in lowered for marker in ["list", "show", "provide", "give me", "which are", "what are"]):
         return "literal_extraction"
     return "standard"
+
+
+def _expand_formula_query(query: str) -> str:
+    cleaned = " ".join(query.split()).strip()
+    if not cleaned or not _is_formula_query(cleaned):
+        return cleaned
+    lowered = cleaned.lower()
+    expansion_terms = [term for term in FORMULA_QUERY_EXPANSION_TERMS if term not in lowered]
+    if not expansion_terms:
+        return cleaned
+    return f"{cleaned} | focus on {'; '.join(expansion_terms[:4])}"
 
 
 def _derive_required_evidence(query: str, query_type: str) -> list[str]:
@@ -255,8 +380,14 @@ def _build_default_plan(query: str, query_type: str, complexity: str) -> Executi
 
 def analyze_query_step(state: dict) -> dict:
     query = state["query"].strip()
-    query_type = classify_query(query)
+    recent_turns = _normalize_recent_turns(state.get("recent_turns"))
+    resolution = resolve_conversational_query(query, recent_turns)
     complexity_score, complexity_label = _estimate_query_complexity(query)
+    formula_mode = _is_formula_query(query) or _is_formula_query(str(resolution.get("rewritten_query") or query))
+    active_query = str(resolution.get("rewritten_query") or query).strip() or query
+    if formula_mode:
+        active_query = _expand_formula_query(active_query)
+    query_type = classify_query(active_query)
     orchestration_level = 1
     if complexity_score >= 3:
         orchestration_level = 2
@@ -275,15 +406,17 @@ def analyze_query_step(state: dict) -> dict:
         "query_type": query_type,
         "complexity_score": complexity_score,
         "complexity": complexity_label,
+        "follow_up_rewrite_applied": bool(resolution.get("is_follow_up")),
     }
     retrieval_parameters: RetrievalParameters = {
-        "section_top_k": 3,
-        "subsection_top_k": 6,
-        "semantic_top_k": 18,
-        "final_top_k": 12,
+        "section_top_k": 4 if formula_mode else 3,
+        "subsection_top_k": 8 if formula_mode else 6,
+        "semantic_top_k": 28 if formula_mode else 18,
+        "final_top_k": 16 if formula_mode else 12,
         "include_references": "reference" in query.lower() or "citation" in query.lower(),
-        "disable_subsection_filter": False,
+        "disable_subsection_filter": formula_mode,
         "expanded_scope": False,
+        "formula_mode": formula_mode,
     }
 
     logger.info(
@@ -298,8 +431,10 @@ def analyze_query_step(state: dict) -> dict:
     return {
         **state,
         "query": query,
-        "active_query": query,
+        "active_query": active_query,
         "query_type": query_type,
+        "formula_mode": formula_mode,
+        "recent_turns": recent_turns,
         "query_analysis": query_analysis,
         "orchestration_level": orchestration_level,
         "should_plan": should_plan,
@@ -312,7 +447,10 @@ def analyze_query_step(state: dict) -> dict:
         "execution_plan": _build_default_plan(query, query_type, complexity_label),
         "retrieval_parameters": retrieval_parameters,
         "retrieval_attempts": [],
-        "execution_trace": _append_trace(state, f"query_analysis:l{orchestration_level}:{complexity_label}"),
+        "execution_trace": _append_trace(
+            state,
+            f"query_analysis:l{orchestration_level}:{complexity_label}:followup={bool(resolution.get('is_follow_up'))}",
+        ),
     }
 
 
@@ -530,9 +668,9 @@ def adaptive_retry_step(state: dict) -> dict:
 
     missing = list(diagnostics.get("missing_required_fields", []))
     retry_suffix = " ".join(missing[:3]) if missing else "broader evidence"
-    active_query = state["query"]
+    active_query = str(state.get("active_query") or state["query"])
     if retry_suffix:
-        active_query = f"{state['query']} {retry_suffix}"
+        active_query = f"{active_query} {retry_suffix}"
 
     attempt: RetrievalAttempt = {
         "attempt": retry_count,
@@ -736,6 +874,88 @@ def _render_context(db, filtered_chunks: list[dict], max_tokens: int = 2200) -> 
     return "\n\n".join(parts), used_chunks
 
 
+def _equation_item_score(item: Mapping[str, object]) -> float:
+    latex = str(item.get("latex") or "").strip()
+    lowered = latex.lower()
+    score = float(item.get("quality_score") or 0.0)
+    if "=" in latex:
+        score += 2.0
+    if any(symbol in latex for symbol in ("+", "Δ", "∆", "×", "*", "∈", "≪", "≤", "≥", "/", "^")):
+        score += 0.8
+    if re.search(r"\b(?:w0|ba|ax|h)\b", lowered):
+        score += 1.4
+    if any(marker in lowered for marker in ("where ", "defined as", "denotes", "represents", "composition")):
+        score += 0.7
+    if re.fullmatch(r"[A-Za-zΔ∆αβσ_'\s0-9]+", latex):
+        score -= 0.9
+    return round(score, 4)
+
+
+def _preferred_equation_items(equation_collection: Mapping[str, object] | None, *, limit: int = 4) -> list[dict]:
+    if not isinstance(equation_collection, Mapping):
+        return []
+    items = equation_collection.get("items")
+    if not isinstance(items, list):
+        return []
+    ranked: list[dict] = []
+    for raw_item in items:
+        if not isinstance(raw_item, Mapping):
+            continue
+        latex = str(raw_item.get("latex") or "").strip()
+        if not latex:
+            continue
+        ranked.append({**raw_item, "_equation_score": _equation_item_score(raw_item)})
+    if not ranked:
+        return []
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("_equation_score") or 0.0),
+            1 if "=" in str(item.get("latex") or "") else 0,
+            len(str(item.get("latex") or "")),
+        ),
+        reverse=True,
+    )
+    best_score = float(ranked[0].get("_equation_score") or 0.0)
+    kept: list[dict] = []
+    for item in ranked:
+        item_score = float(item.get("_equation_score") or 0.0)
+        if item_score >= best_score - 1.5 or len(kept) < 3:
+            kept.append(item)
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+def _answer_entries_look_like_equations(entries: list[str]) -> bool:
+    if not entries:
+        return False
+    equation_like = 0
+    for entry in entries:
+        cleaned = str(entry).strip()
+        if "=" in cleaned or any(symbol in cleaned for symbol in ("Δ", "∆", "∈", "×")):
+            equation_like += 1
+    return equation_like >= max(1, len(entries) // 2)
+
+
+def _render_equation_context(equation_collection: Mapping[str, object] | None) -> str:
+    preferred_items = _preferred_equation_items(equation_collection, limit=5)
+    if not preferred_items:
+        return ""
+    rendered_items: list[str] = []
+    for item in preferred_items:
+        latex = str(item.get("latex") or "").strip()
+        description = str(item.get("description") or "").strip()
+        if not latex:
+            continue
+        line = f"- {latex}"
+        if description:
+            line += f" :: {description}"
+        rendered_items.append(line)
+    if not rendered_items:
+        return ""
+    return "Structured equations extracted from the paper:\n" + "\n".join(rendered_items)
+
+
 def _normalize_answer_tiers(value: object) -> AnswerTiers:
     if not isinstance(value, dict):
         return {
@@ -778,6 +998,16 @@ def generate_grounded_answer_step(state: dict) -> dict:
     filtered_chunks = list(state.get("filtered_chunks", []))
     diagnostics = state.get("evidence_diagnostics", {})
     context, used_chunks = _render_context(state.get("db"), filtered_chunks)
+    equation_collection = (
+        get_extracted_method_equations(state.get("db"), state.get("paper_id"))
+        if state.get("formula_mode")
+        else None
+    )
+    preferred_equations = _preferred_equation_items(equation_collection, limit=5)
+    equation_context = _render_equation_context({"items": preferred_equations})
+    combined_context = context
+    if equation_context:
+        combined_context = f"{equation_context}\n\n{context}".strip()
     required_evidence = list((state.get("execution_plan") or {}).get("required_evidence", []))
     allow_general_background = _allows_general_background(state["query"], diagnostics)
     response_mode = _response_mode(state["query"])
@@ -800,7 +1030,7 @@ def generate_grounded_answer_step(state: dict) -> dict:
         "For extraction-style questions, prefer literal extraction over abstract summary.\n"
         f"Required evidence types: {required_evidence}\n\n"
         f"Question:\n{state['query']}\n\n"
-        f"Context:\n{context}"
+        f"Context:\n{combined_context}"
     )
     try:
         answer_payload = generate_json(prompt)
@@ -810,6 +1040,23 @@ def generate_grounded_answer_step(state: dict) -> dict:
 
     answer_tiers = _normalize_answer_tiers(answer_payload.get("answer_tiers"))
     raw_claims = answer_payload.get("claims") if isinstance(answer_payload.get("claims"), list) else []
+    if (
+        state.get("formula_mode")
+        and preferred_equations
+        and not _answer_entries_look_like_equations(answer_tiers.get("evidence_backed", []))
+    ):
+        synthesized_equations: list[str] = []
+        for item in preferred_equations[:4]:
+            if not isinstance(item, Mapping):
+                continue
+            latex = str(item.get("latex") or "").strip()
+            description = str(item.get("description") or "").strip()
+            if not latex:
+                continue
+            synthesized_equations.append(f"{latex}{f' — {description}' if description else ''}")
+        if synthesized_equations:
+            answer_tiers["evidence_backed"] = synthesized_equations
+
     answer_text = _format_answer_from_tiers(answer_tiers)
     if not answer_text:
         answer_text = "Insufficient grounded evidence to produce a detailed answer."
@@ -855,6 +1102,35 @@ def generate_grounded_answer_step(state: dict) -> dict:
         if not used_ids or chunk["chunk_id"] in used_ids
     ]
     final_confidence = round(_average(claim["confidence"] for claim in grounded_claims), 4) if grounded_claims else 0.0
+    if state.get("formula_mode"):
+        logger.info(
+            "qa_formula_equation_candidates query=%s equation_candidates_after_cleanup=%s",
+            state.get("active_query") or state.get("query"),
+            [
+                {
+                    "latex": str(item.get("latex") or "")[:220],
+                    "section": item.get("section_name"),
+                    "score": round(float(item.get("_equation_score", item.get("quality_score", 0.0))), 4),
+                }
+                for item in preferred_equations
+            ],
+        )
+        logger.info(
+            "qa_formula_selected_context query=%s selected_context=%s",
+            state.get("active_query") or state.get("query"),
+            [
+                {
+                    "chunk_id": chunk.get("chunk_id"),
+                    "section": chunk.get("section_name"),
+                    "subsection": chunk.get("subsection_name"),
+                    "role": chunk.get("role"),
+                    "score": round(float(chunk.get("score", 0.0)), 4),
+                    "rerank_score": round(float(chunk.get("rerank_score", chunk.get("score", 0.0))), 4),
+                    "content": str(chunk.get("content") or "")[:260],
+                }
+                for chunk in used_chunks
+            ],
+        )
     logger.info(
         "qa_grounded_generation paper_id=%s grounded_claims=%s final_confidence=%s",
         state.get("paper_id"),
@@ -866,6 +1142,11 @@ def generate_grounded_answer_step(state: dict) -> dict:
         "context": context,
         "answer": answer_text,
         "answer_tiers": answer_tiers,
+        "equations": (
+            {"source": "extracted", "items": preferred_equations}
+            if preferred_equations
+            else (equation_collection or {"source": None, "items": []})
+        ),
         "grounded_claims": grounded_claims,
         "final_confidence": final_confidence,
         "sources": sources,

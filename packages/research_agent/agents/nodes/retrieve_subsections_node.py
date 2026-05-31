@@ -19,6 +19,7 @@ def retrieve_subsections_node(state: dict) -> dict:
         paper_id,
         section_names=section_names,
         subsection_top_k=int(retrieval_parameters.get("subsection_top_k", 6)),
+        formula_mode=bool(retrieval_parameters.get("formula_mode", False)),
     )
 
     logger.info(

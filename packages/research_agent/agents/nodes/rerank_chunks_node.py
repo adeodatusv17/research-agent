@@ -13,6 +13,7 @@ def rerank_chunks_node(state: dict) -> dict:
         selected_sections=state.get("selected_sections", []),
         query_intent=state.get("query_type", "method"),
         top_k=int(retrieval_parameters.get("final_top_k", 12)),
+        formula_mode=bool(retrieval_parameters.get("formula_mode", False)),
     )
     retrieval_confidence = (
         sum(

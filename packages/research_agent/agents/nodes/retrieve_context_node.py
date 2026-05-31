@@ -26,6 +26,8 @@ def retrieve_context_node(state: dict) -> dict:
         subsection_names=subsection_names or None,
         query_intent=state.get("query_type", "method"),
         semantic_top_k=int(retrieval_parameters.get("semantic_top_k", 18)),
+        formula_mode=bool(retrieval_parameters.get("formula_mode", False)),
+        debug_query=state.get("active_query") or state.get("query"),
     )
 
     logger.info(

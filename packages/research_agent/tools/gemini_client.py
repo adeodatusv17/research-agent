@@ -19,6 +19,10 @@ REASONING_MODEL_CANDIDATES = [
     os.getenv("GEMINI_REASONING_MODEL_3", "gemini-3.1-flash-lite"),
     os.getenv("GEMINI_REASONING_MODEL_4", "gemma-3-27b-it"),
 ]
+PRIMARY_MODEL_MAX_RETRIES = int(os.getenv("GEMINI_PRIMARY_MAX_RETRIES", "1"))
+FALLBACK_MODEL_MAX_RETRIES = int(os.getenv("GEMINI_FALLBACK_MAX_RETRIES", "2"))
+PRIMARY_RATE_LIMIT_DELAY_SECONDS = float(os.getenv("GEMINI_PRIMARY_RATE_LIMIT_DELAY_SECONDS", "3.0"))
+FALLBACK_RATE_LIMIT_DELAY_SECONDS = float(os.getenv("GEMINI_FALLBACK_RATE_LIMIT_DELAY_SECONDS", "5.0"))
 
 
 def _get_client() -> genai.Client:
@@ -45,10 +49,18 @@ def _should_fallback(exc: Exception) -> bool:
     return any(marker in message for marker in fallback_markers)
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in ["429", "resource exhausted", "quota", "rate limit", "exhausted"])
+
+
 def _generate_content(
     prompt: str,
     model: str,
     response_mime_type: str | None = None,
+    *,
+    max_retries: int = 3,
+    base_delay: float = 10.0,
 ) -> str:
     client = _get_client()
     config = (
@@ -57,9 +69,7 @@ def _generate_content(
         else None
     )
     
-    max_retries = 3
-    base_delay = 10.0
-    
+
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(model=model, contents=prompt, config=config)
@@ -67,15 +77,14 @@ def _generate_content(
         except Exception as exc:
             if attempt == max_retries - 1:
                 raise
-            
-            exc_str = str(exc).lower()
-            if "429" in exc_str or "resource" in exc_str or "exhausted" in exc_str or "quota" in exc_str:
+
+            if _is_rate_limit_error(exc):
                 delay = base_delay * (2 ** attempt)
                 logger.warning("gemini_rate_limit_exceeded model=%s attempt=%s waiting=%ss", model, attempt + 1, delay)
                 time.sleep(delay)
             else:
                 raise
-                
+
     raise RuntimeError(f"Failed to generate content after {max_retries} attempts")
 
 
@@ -83,7 +92,12 @@ def generate_text_with_fallback(prompt: str) -> str:
     last_exception: Exception | None = None
     for model in REASONING_MODEL_CANDIDATES:
         try:
-            text = _generate_content(prompt, model)
+            text = _generate_content(
+                prompt,
+                model,
+                max_retries=FALLBACK_MODEL_MAX_RETRIES,
+                base_delay=FALLBACK_RATE_LIMIT_DELAY_SECONDS,
+            )
             logger.info("fallback_text_model_success model=%s", model)
             return text
         except Exception as exc:
@@ -99,7 +113,12 @@ def generate_text_with_fallback(prompt: str) -> str:
 
 def generate_answer(prompt: str) -> str:
     try:
-        return _generate_content(prompt, MODEL_NAME)
+        return _generate_content(
+            prompt,
+            MODEL_NAME,
+            max_retries=PRIMARY_MODEL_MAX_RETRIES,
+            base_delay=PRIMARY_RATE_LIMIT_DELAY_SECONDS,
+        )
     except Exception as exc:
         if not _should_fallback(exc):
             raise
@@ -109,7 +128,13 @@ def generate_answer(prompt: str) -> str:
 
 def generate_json(prompt: str) -> dict:
     try:
-        text = _generate_content(prompt, MODEL_NAME, response_mime_type="application/json")
+        text = _generate_content(
+            prompt,
+            MODEL_NAME,
+            response_mime_type="application/json",
+            max_retries=PRIMARY_MODEL_MAX_RETRIES,
+            base_delay=PRIMARY_RATE_LIMIT_DELAY_SECONDS,
+        )
         return json.loads(text or "{}")
     except json.JSONDecodeError:
         logger.warning("primary_json_model_returned_invalid_json model=%s", MODEL_NAME)
@@ -125,7 +150,13 @@ def generate_json_with_reasoning_fallback(prompt: str) -> dict:
     last_exception: Exception | None = None
     for model in REASONING_MODEL_CANDIDATES:
         try:
-            text = _generate_content(prompt, model, response_mime_type="application/json")
+            text = _generate_content(
+                prompt,
+                model,
+                response_mime_type="application/json",
+                max_retries=FALLBACK_MODEL_MAX_RETRIES,
+                base_delay=FALLBACK_RATE_LIMIT_DELAY_SECONDS,
+            )
             logger.info("reasoning_model_success model=%s", model)
             return json.loads(text or "{}")
         except json.JSONDecodeError as exc:

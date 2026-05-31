@@ -21,6 +21,7 @@ def retrieve_sections_node(state: dict) -> dict:
         query_type=query_type,
         include_references=bool(retrieval_parameters.get("include_references", False)),
         section_top_k=int(retrieval_parameters.get("section_top_k", 3)),
+        formula_mode=bool(retrieval_parameters.get("formula_mode", False)),
     )
 
     logger.info(

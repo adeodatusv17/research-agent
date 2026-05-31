@@ -110,3 +110,202 @@ This file tracks notable problems encountered during the project, along with obs
     - inferred-from-evidence
     - general background knowledge
   - ensure future QA outputs can distinguish these categories instead of blending them invisibly
+
+## 2026-05-31
+
+### QA reliability investigation: conversational follow-ups, equation retrieval, and math rendering
+
+- Scope:
+  - audit the current QA stack before making further behavioral changes
+  - preserve the existing hierarchical retrieval strengths
+  - prefer small, reversible fixes over retrieval redesign
+
+### Current retrieval and QA architecture
+
+- Retrieval is not a flat generic RAG stack.
+- The active QA path is:
+  - frontend `QAChat` -> `POST /papers/{paper_id}/qa`
+  - `rag_service.answer_question(...)`
+  - LangGraph QA workflow in `research_qa_graph.py`
+  - `query_analysis -> retrieve_sections -> retrieve_subsections -> retrieve_context -> rerank_chunks -> evidence_diagnostics -> optional retry -> generate_answer -> optional verify/critique/revise -> evaluate`
+- Retrieval is a dense pgvector pipeline hybridized with structural and heuristic signals:
+  - query embedding with `BAAI/bge-base-en-v1.5`
+  - section retrieval
+  - subsection retrieval inside selected sections
+  - chunk retrieval inside selected section/subsection scope
+  - quality filtering
+  - role/importance annotation
+  - heuristic reranking
+  - section-balanced final selection
+- Chunk reranking currently uses:
+  - `0.5 * cosine_similarity`
+  - `0.3 * role_match_weight`
+  - `0.2 * importance`
+- Evidence diagnostics and adaptive retry already exist, but retry rewriting is retrieval-broadening logic, not conversational follow-up resolution.
+- The current "hybrid" behavior comes from combining dense similarity with:
+  - section priors
+  - section weights
+  - chunk role inference
+  - chunk importance
+  - quality filtering
+  - balanced selection
+
+### Issue 1: missing short-term conversational memory for follow-up QA
+
+- Observed failure:
+  - follow-up questions like `What's the mathematical expression?`, `How does it work?`, `Where does the paper say that?`, and `What's the equation?` can lose the referent from the previous turn
+- Findings:
+  - frontend chat history is stored only in browser `sessionStorage`
+  - frontend sends only `{ query }` to the backend QA route
+  - backend `QARequest` contains only `query: str`
+  - `QAState` has `query` and `active_query`, but no chat history, previous turn, or session memory field
+  - retrieval nodes embed `state["active_query"]` or `state["query"]` only
+  - current adaptive rewrite only happens after weak evidence and simply broadens scope by appending missing evidence hints like `broader evidence`
+- Root cause:
+  - the system is currently single-turn for retrieval
+  - short-term conversation context never reaches the retrieval pipeline
+- Low-risk proposed fix:
+  - add bounded short-term conversation context scoped to the current paper and current chat session only
+  - send the last 1-3 user/assistant turns to the backend
+  - add a pre-retrieval standalone-query rewrite step that activates only on follow-up or deictic questions
+  - keep the user-facing answer tied to the original question, while retrieval uses the rewritten standalone query
+  - examples:
+    - `What's the mathematical expression?` -> `What is the mathematical expression for LoRA?`
+    - `How does it work?` -> `How does LoRA work?`
+    - `Where does the paper say that?` -> preserve the prior claim target in the rewritten retrieval query
+- Existing mechanisms that can be extended safely:
+  - frontend already has recent chat messages in `sessionStorage`
+  - backend already has `active_query`, which is the right place to store a rewritten standalone retrieval query
+- Risks:
+  - over-aggressive rewriting could distort already self-contained questions
+  - leaking prior assistant wording into retrieval can amplify earlier mistakes if not bounded
+- Acceptance criteria:
+  - follow-up questions resolve to the prior topic within the same paper session
+  - standalone queries remain unchanged
+  - no long-term user memory or cross-paper memory is introduced
+
+### Issue 2: formula / equation retrieval quality
+
+- Observed failure:
+  - formula-oriented questions can retrieve hyperparameters, settings, symbol fragments, or table entries instead of actual equations or mathematical definitions
+- Findings:
+  - formula awareness currently exists more strongly in answer generation than in retrieval
+  - `_is_formula_query(...)` and `response_mode = equation_extraction` affect prompting, not section selection or chunk intent classification
+  - retrieval intent classification has no dedicated `equation` or `formula` query type
+  - a query like `What's the mathematical expression?` will often default to `method`
+  - for `method` intent, rerank role matches currently favor `method` and `algorithm`, not `equation` or `formula`
+  - chunk storage uses sanitized content, not raw parsed text
+  - equation-heavy chunks can still be removed during indexing because `sanitize_chunk_content(...)` drops chunks judged too symbol-heavy
+  - `EQUATION:` lines are preserved during parsing and chunk splitting, but indexing sanitization can later strip or drop them
+  - PDF equation detection currently includes mojibake symbol markers like `âˆ‘` and `Î£`, which indicates symbol normalization is already imperfect in the parse path
+  - the structured paper analysis already contains `methods.equations.items`, but the QA shortcut path does not use those extracted equations for formula queries
+- Root causes:
+  - formula intent is not first-class in retrieval routing
+  - equation/formula chunks are under-boosted during reranking
+  - some math-heavy evidence is lost or weakened before it becomes searchable chunk content
+- Low-risk proposed fixes:
+  - add a formula/equation retrieval flag separate from the existing high-level query type
+  - when that flag is on:
+    - rewrite the retrieval query toward standalone mathematical intent
+    - mildly boost section priors for `method`, `theory`, and math-dense subsections
+    - mildly boost chunk roles `equation`, `formula`, and `theory` during reranking
+    - allow a slightly broader candidate pool before final rerank
+  - keep the change gated to formula-mode queries only
+  - add a fallback that uses extracted `paper_analysis.methods.equations.items` when the source is `extracted`, not `llm_generated`
+  - add evaluation examples specifically for formula queries before and after the change
+- Medium-to-high risk ideas that may affect retrieval quality globally:
+  - changing global rerank weights for all queries
+  - disabling or heavily relaxing quality filters across the board
+  - replacing hierarchical retrieval with flat retrieval, self-query retrieval, or a new retrieval framework
+  - changing global chunking boundaries without a targeted formula-specific evaluation set
+- What should not be changed:
+  - the section -> subsection -> chunk retrieval shape
+  - the current dense embedding stack and vector schema as part of this QA-only reliability work
+  - the evidence diagnostics / bounded retry loop
+- Acceptance criteria:
+  - formula queries return full equations or mathematical definitions when they exist in the paper
+  - symbol fragments like isolated `r = 4`, `W_q`, `W_v` are not returned as the main answer unless they are part of a full retrieved expression
+  - non-math queries preserve current retrieval quality
+- Implementation status after fix:
+  - implemented a gated `formula_mode` retrieval path with conservative formula query expansion
+  - added formula-query logging for `retrieved_top_20`, `reranked_top_20`, and `selected_context`
+  - added ranked section-level equation extraction with quality scoring and formula-mode answer preference
+  - validated on the LoRA paper:
+    - chunk-level retrieval top-20 is still noisy and remains dominated by hyperparameter/table fragments
+    - the final answer is now rescued by high-confidence section-extracted equations such as:
+      - `W0 + ΔW = W0 + BA`
+      - `W = W0 + BA`
+      - `h = W0x + ΔWx = W0x + BAx`
+  - validated a non-formula LoRA comparison query and observed no obvious regression in the answer quality
+- Residual risk:
+  - chunk-level math retrieval is still weak for some papers, so the current formula fix relies on the extracted-equation path more than the chunk path
+  - this is acceptable as a low-risk targeted fix, but chunking/indexing quality for equations may still need a future dedicated pass
+
+### Issue 3: mathematical rendering and QA UX
+
+- Observed failure:
+  - even when math evidence exists, the QA answer is hard to read and often appears as plain text bullets
+- Findings across the full path:
+  - PDF parsing marks some short lines as `EQUATION: ...`
+  - chunking tries to keep equation lines with nearby explanation
+  - indexing sanitization can replace `EQUATION:` markers and may drop equation-heavy content altogether
+  - QA response formatting currently returns only markdown text plus `answer_tiers`
+  - QA does not return structured equation blocks or LaTeX payloads
+  - the paper analysis UI already has working KaTeX rendering for extracted equations
+  - the QA chat UI uses `ReactMarkdown` only and does not enable `remark-math` / `rehype-katex`
+- Root causes:
+  - mathematical content is not preserved as a first-class structured QA response
+  - the QA frontend cannot render math markup even if the backend returns it
+- Low-risk proposed fixes:
+  - preserve structured equations for formula-mode QA responses when available
+  - reuse the existing equation rendering pattern from the paper analysis UI in the QA UI
+  - enable math-aware markdown rendering in QA chat if inline/block LaTeX is returned
+  - keep citations/source cards separate from equation rendering
+- Risks:
+  - partial or malformed LaTeX could render poorly if sent straight to KaTeX without fallback handling
+  - mixing plain-text equation fragments and KaTeX output in the same message could look inconsistent unless structured cleanly
+- Acceptance criteria:
+  - formula-mode answers render equations as readable block math or clearly formatted expressions
+  - the QA UI remains readable for normal prose answers
+  - source citations remain intact and do not break math layout
+
+### Implementation plan
+
+- Phase 1: document and instrument
+  - add a compact follow-up query evaluation set
+  - add a compact formula query evaluation set
+  - capture before/after retrieval outputs and final answers
+- Phase 2: low-risk conversational follow-up support
+  - extend the QA request shape with recent turns
+  - add a follow-up detection + standalone query rewrite step before retrieval
+  - write the rewritten query into `active_query`
+- Phase 3: low-risk formula retrieval improvements
+  - add a formula-mode retrieval flag
+  - gate section and role boosts to formula-mode only
+  - use extracted equation items as supplementary evidence when available
+- Phase 4: math rendering
+  - return structured equation payloads for formula-mode answers
+  - render them in the QA UI using the existing KaTeX-capable pattern
+
+### What can be improved with low risk
+
+- bounded short-term conversation context for the current paper session only
+- standalone-query rewriting for follow-up questions
+- formula-mode-only retrieval boosts
+- supplementary use of extracted equation items from paper analysis
+- QA frontend math rendering improvements
+
+### What may affect retrieval quality globally
+
+- changing global rerank weights
+- changing global section priors
+- relaxing quality filters for all queries
+- changing chunk sanitization or indexing behavior for all chunk types without a focused evaluation
+
+### What should not be changed in this pass
+
+- do not replace hierarchical retrieval
+- do not swap retrieval frameworks
+- do not add long-term memory
+- do not redesign the LangGraph QA workflow
+- do not broaden equation-friendly retrieval heuristics to all query types by default

@@ -219,11 +219,17 @@ export interface AnswerTiers {
   general_background: string[];
 }
 
+export interface ConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface QAResponse {
   request_id?: string;
   answer: string;
   sources: QASource[];
   answer_tiers?: AnswerTiers;
+  equations?: EquationCollection | null;
 }
 
 export interface ChatMessage {
@@ -231,6 +237,7 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   sources?: QASource[];
+  equations?: EquationCollection | null;
   timestamp: number;
 }
 

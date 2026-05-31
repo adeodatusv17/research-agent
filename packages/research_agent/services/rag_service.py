@@ -5,6 +5,7 @@ from time import perf_counter
 from sqlalchemy.orm import Session
 
 from research_agent.services.paper_analysis_service import get_structured_answer_if_available
+from research_agent.services.qa_orchestration_service import resolve_conversational_query
 from research_agent.tools.embedder import get_tokenizer
 from research_agent.tools.gemini_client import generate_answer
 
@@ -106,20 +107,25 @@ def answer_question(
     paper_id: uuid.UUID,
     query: str,
     *,
+    recent_turns: list[dict[str, str]] | None = None,
     request_id: str | None = None,
 ) -> dict[str, object]:
     effective_request_id = request_id or str(uuid.uuid4())
     started_at = perf_counter()
+    conversation_resolution = resolve_conversational_query(query, recent_turns or [])
+    retrieval_query = str(conversation_resolution.get("rewritten_query") or query).strip() or query
     logger.info(
-        "qa_request_started request_id=%s paper_id=%s query=%s",
+        "qa_request_started request_id=%s paper_id=%s query=%s followup_rewrite=%s retrieval_query=%s",
         effective_request_id,
         paper_id,
         query,
+        bool(conversation_resolution.get("is_follow_up")),
+        retrieval_query,
     )
     # Skip the structured shortcut for code/implementation requests — it only returns
     # a brief summary like "Proposed: Conformer; Baselines: Transformer" which is not
     # useful when the user explicitly asks for code or a detailed explanation.
-    if not _has_code_intent(query):
+    if not _has_code_intent(query) and not conversation_resolution.get("is_follow_up"):
         structured_answer = get_structured_answer_if_available(db, paper_id, query)
         if structured_answer is not None:
             logger.info(
@@ -159,6 +165,7 @@ def answer_question(
                     "inferred_from_evidence": [],
                     "general_background": [],
                 },
+                "equations": {"source": None, "items": []},
                 "grounded_claims": [],
                 "retrieval_confidence": 1.0,
                 "final_confidence": 1.0,
@@ -207,9 +214,11 @@ def answer_question(
             {
                 "db": db,
                 "query": query,
-                "active_query": query,
+                "active_query": retrieval_query,
                 "query_type": "",
+                "formula_mode": False,
                 "paper_id": paper_id,
+                "recent_turns": recent_turns or [],
                 "query_embedding": [],
                 "analysis_hits": {},
                 "orchestration_level": 1,
@@ -233,6 +242,7 @@ def answer_question(
                 "context": "",
                 "answer": "",
                 "answer_tiers": {},
+                "equations": {},
                 "grounded_claims": [],
                 "final_confidence": 0.0,
                 "verifier_report": {},
@@ -259,6 +269,7 @@ def answer_question(
         "retrieval_confidence": final_state.get("retrieval_confidence"),
         "evidence_diagnostics": final_state.get("evidence_diagnostics"),
         "answer_tiers": final_state.get("answer_tiers"),
+        "equations": final_state.get("equations"),
         "grounded_claims": final_state.get("grounded_claims"),
         "final_confidence": final_state.get("final_confidence"),
         "verifier_report": final_state.get("verifier_report"),

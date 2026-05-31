@@ -30,6 +30,7 @@ class RetrievalParameters(TypedDict, total=False):
     include_references: bool
     disable_subsection_filter: bool
     expanded_scope: bool
+    formula_mode: bool
 
 
 class RetrievalAttempt(TypedDict, total=False):
@@ -105,7 +106,9 @@ class QAState(TypedDict, total=False):
     query: str
     active_query: str
     query_type: str
+    formula_mode: bool
     paper_id: str | None
+    recent_turns: list[dict]
     query_analysis: dict
     query_embedding: list[float]
     analysis_hits: dict
@@ -130,6 +133,7 @@ class QAState(TypedDict, total=False):
     context: str
     answer: str
     answer_tiers: AnswerTiers
+    equations: dict
     grounded_claims: list[GroundedClaim]
     final_confidence: float
     verifier_report: VerificationReport

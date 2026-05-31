@@ -1,4 +1,5 @@
 import type {
+  ConversationTurn,
   PaperListResponse,
   Paper,
   UploadResponse,
@@ -82,11 +83,16 @@ export const getAnalysis = (id: string) =>
   req<PaperAnalysis>(`/papers/${id}/analysis`);
 
 // QA
-export const askQuestion = (id: string, query: string, metadata?: RequestMetadata) =>
+export const askQuestion = (
+  id: string,
+  query: string,
+  metadata?: RequestMetadata,
+  recentTurns?: ConversationTurn[],
+) =>
   req<QAResponse>(`/papers/${id}/qa`, {
     method: "POST",
     headers: metadata?.requestId ? { "X-Request-Id": metadata.requestId } : undefined,
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({ query, recent_turns: recentTurns ?? [] }),
   });
 
 // Reproducibility
