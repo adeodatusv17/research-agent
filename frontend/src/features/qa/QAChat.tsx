@@ -8,7 +8,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import clsx from "clsx";
 import { askQuestion } from "@/lib/api-client";
-import type { ChatMessage, ConversationTurn, EquationCollection, PaperDomain, QASource } from "@/lib/types";
+import type { ChatMessage, ConversationTurn, EquationCollection, PaperDomain, QASource, TableArtifact } from "@/lib/types";
 import toast from "react-hot-toast";
 
 interface QAChatProps {
@@ -184,6 +184,80 @@ function EquationPanel({ equations }: { equations: EquationCollection | null | u
   );
 }
 
+function parseTableRows(normalizedTableText: string): string[][] {
+  return normalizedTableText
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split("|").map((cell) => cell.trim()));
+}
+
+function TableCard({ table }: { table: TableArtifact }) {
+  const rows = parseTableRows(table.normalized_table_text ?? "").slice(0, 8);
+  const header = table.table_label ?? "Table";
+  const meta = [
+    table.table_type ? table.table_type.replace(/_/g, " ") : null,
+    table.page_number ? `p.${table.page_number}` : null,
+  ].filter(Boolean);
+
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/20 p-4">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium text-white">{header}</p>
+          {table.caption && <p className="mt-1 text-sm leading-relaxed text-gray-400">{table.caption}</p>}
+        </div>
+        {meta.length > 0 && (
+          <div className="rounded-full border border-white/10 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-gray-500">
+            {meta.join(" • ")}
+          </div>
+        )}
+      </div>
+      {rows.length > 0 ? (
+        <div className="overflow-x-auto rounded-lg border border-white/10">
+          <table className="min-w-full border-collapse text-left text-xs">
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={`${header}-${rowIndex}`} className={clsx(rowIndex === 0 && "bg-white/[0.04]")}>
+                  {row.map((cell, cellIndex) => (
+                    <td key={`${header}-${rowIndex}-${cellIndex}`} className="border-t border-white/10 px-3 py-2 text-gray-300 first:border-l-0">
+                      {cell || "—"}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-gray-400">
+          {table.normalized_table_text ?? "No table rows available."}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TablePanel({ tables }: { tables: TableArtifact[] | null | undefined }) {
+  const tableItems = tables?.filter((table) => (table.normalized_table_text ?? "").trim().length > 0) ?? [];
+  if (tableItems.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mb-4 rounded-xl border border-white/10 bg-bg-hover/40 p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm text-gray-300">
+        <BookOpen className="h-4 w-4" />
+        <span>Tables from the paper</span>
+      </div>
+      <div className="space-y-4">
+        {tableItems.map((table, index) => (
+          <TableCard key={table.table_id ?? `qa-table-${index}`} table={table} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function QAChat({ paperId, domain }: QAChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -251,6 +325,7 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
         content: data.answer,
         sources: data.sources,
         equations: data.equations,
+        tables: data.tables,
         timestamp: Date.now(),
       };
       setMessages((prev) => [...prev, assistantMsg]);
@@ -318,6 +393,7 @@ export default function QAChat({ paperId, domain }: QAChatProps) {
                 {msg.role === "assistant" ? (
                   <div className="prose prose-invert max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent prose-headings:text-text-primary prose-a:text-text-primary prose-strong:text-text-primary">
                     <EquationPanel equations={msg.equations} />
+                    <TablePanel tables={msg.tables} />
                     <ReactMarkdown components={{ code: CodeBlock as any }}>{msg.content}</ReactMarkdown>
                   </div>
                 ) : (

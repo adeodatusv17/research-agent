@@ -41,6 +41,7 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
     section_segments: list[dict[str, str | int | None]] = []
     indexed_sections: list[dict[str, str | int | None]] = []
     indexed_subsections: list[dict[str, str | int | None]] = []
+    indexed_tables: list[dict[str, object]] = []
     chunks: list[dict[str, int | str | None]] = []
     max_chunk_tokens = 0
 
@@ -66,14 +67,16 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
         section_segments = list(index_result["section_segments"])
         indexed_sections = list(index_result["indexed_sections"])
         indexed_subsections = list(index_result["indexed_subsections"])
+        indexed_tables = list(index_result["indexed_tables"])
         chunks = list(index_result["chunks"])
         max_chunk_tokens = int(index_result["max_chunk_tokens"])
 
         logger.info(
-            "chunking_complete paper_id=%s number_of_sections=%s number_of_subsections=%s number_of_chunk_segments=%s number_of_chunks=%s max_chunk_tokens=%s domain=%s domain_confidence=%s embedding_model=%s",
+            "chunking_complete paper_id=%s number_of_sections=%s number_of_subsections=%s number_of_tables=%s number_of_chunk_segments=%s number_of_chunks=%s max_chunk_tokens=%s domain=%s domain_confidence=%s embedding_model=%s",
             paper_id,
             len(indexed_sections),
             len(indexed_subsections),
+            len(indexed_tables),
             len(section_segments),
             len(chunks),
             max_chunk_tokens,
@@ -86,10 +89,11 @@ async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)
         db.commit()
 
         logger.info(
-            "upload_complete paper_id=%s sections_created=%s subsections_created=%s chunks_created=%s max_chunk_tokens=%s embedding_count=%s embedding_model=%s",
+            "upload_complete paper_id=%s sections_created=%s subsections_created=%s tables_created=%s chunks_created=%s max_chunk_tokens=%s embedding_count=%s embedding_model=%s",
             paper_id,
             len(indexed_sections),
             len(indexed_subsections),
+            len(indexed_tables),
             len(chunks),
             max_chunk_tokens,
             len(chunks),

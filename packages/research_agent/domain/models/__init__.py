@@ -6,6 +6,7 @@ from research_agent.domain.models.paper_chunk import PaperChunk
 from research_agent.domain.models.paper_repository import PaperRepository
 from research_agent.domain.models.paper_section import PaperSection
 from research_agent.domain.models.paper_subsection import PaperSubsection
+from research_agent.domain.models.paper_table import PaperTable
 from research_agent.domain.models.reproducibility_score import ReproducibilityScore
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "PaperRepository",
     "PaperSection",
     "PaperSubsection",
+    "PaperTable",
     "ReproducibilityScore",
 ]

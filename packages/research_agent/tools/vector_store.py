@@ -7,6 +7,7 @@ from research_agent.domain.models.paper import Paper
 from research_agent.domain.models.paper_chunk import PaperChunk
 from research_agent.domain.models.paper_section import PaperSection
 from research_agent.domain.models.paper_subsection import PaperSubsection
+from research_agent.domain.models.paper_table import PaperTable
 
 
 def store_chunks(
@@ -83,6 +84,42 @@ def store_subsections(
             embedding=embedding,
         )
         for subsection, embedding in zip(subsections, embeddings, strict=False)
+    ]
+
+    db.add_all(records)
+    db.flush()
+    return records
+
+
+def store_tables(
+    db: Session,
+    paper_id,
+    tables: list[dict[str, object]],
+    embeddings: list[list[float]],
+) -> list[PaperTable]:
+    if len(tables) != len(embeddings):
+        raise ValueError("tables and embeddings must have the same length")
+
+    records = [
+        PaperTable(
+            paper_id=paper_id,
+            table_index=int(table["table_index"]),
+            table_label=str(table["table_label"]) if table.get("table_label") else None,
+            caption=str(table["caption"]) if table.get("caption") else None,
+            section_name=str(table["section_name"]) if table.get("section_name") else None,
+            subsection_name=str(table["subsection_name"]) if table.get("subsection_name") else None,
+            page_number=int(table["page_number"]) if table.get("page_number") else None,
+            raw_table_text=str(table["raw_table_text"]),
+            normalized_table_text=str(table["normalized_table_text"]),
+            table_type=str(table["table_type"]) if table.get("table_type") else None,
+            metric_names=list(table.get("metric_names") or []),
+            dataset_names=list(table.get("dataset_names") or []),
+            model_names=list(table.get("model_names") or []),
+            linked_chunk_indexes=list(table.get("linked_chunk_indexes") or []),
+            token_count=int(table["token_count"]) if table.get("token_count") else None,
+            embedding=embedding,
+        )
+        for table, embedding in zip(tables, embeddings, strict=False)
     ]
 
     db.add_all(records)
@@ -212,6 +249,60 @@ def fetch_neighbor_chunks(
             "section_name": row.section_name,
             "subsection_name": row.subsection_name,
             "content": row.content,
+        }
+        for row in rows
+    ]
+
+
+def semantic_search_tables(
+    db: Session,
+    query_embedding: list[float],
+    paper_id: uuid.UUID | None = None,
+    top_k: int = 10,
+) -> list[dict]:
+    distance = PaperTable.embedding.cosine_distance(query_embedding)
+    statement = select(
+        PaperTable.id,
+        PaperTable.paper_id,
+        PaperTable.table_index,
+        PaperTable.table_label,
+        PaperTable.caption,
+        PaperTable.section_name,
+        PaperTable.subsection_name,
+        PaperTable.page_number,
+        PaperTable.raw_table_text,
+        PaperTable.normalized_table_text,
+        PaperTable.table_type,
+        PaperTable.metric_names,
+        PaperTable.dataset_names,
+        PaperTable.model_names,
+        PaperTable.linked_chunk_indexes,
+        (1 - distance).label("score"),
+    )
+
+    if paper_id is not None:
+        statement = statement.where(PaperTable.paper_id == paper_id)
+
+    statement = statement.order_by(distance).limit(top_k)
+    rows = db.execute(statement).all()
+    return [
+        {
+            "table_id": str(row.id),
+            "paper_id": str(row.paper_id),
+            "table_index": int(row.table_index),
+            "table_label": row.table_label,
+            "caption": row.caption,
+            "section_name": row.section_name,
+            "subsection_name": row.subsection_name,
+            "page_number": row.page_number,
+            "raw_table_text": row.raw_table_text,
+            "normalized_table_text": row.normalized_table_text,
+            "table_type": row.table_type,
+            "metric_names": row.metric_names or [],
+            "dataset_names": row.dataset_names or [],
+            "model_names": row.model_names or [],
+            "linked_chunk_indexes": row.linked_chunk_indexes or [],
+            "score": float(row.score),
         }
         for row in rows
     ]

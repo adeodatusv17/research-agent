@@ -64,6 +64,21 @@ export interface EquationCollection {
   items?: EquationItem[] | null;
 }
 
+export interface TableArtifact {
+  table_id?: string | null;
+  table_label?: string | null;
+  caption?: string | null;
+  section_name?: string | null;
+  subsection_name?: string | null;
+  page_number?: number | null;
+  table_type?: string | null;
+  metric_names?: string[] | null;
+  dataset_names?: string[] | null;
+  model_names?: string[] | null;
+  normalized_table_text?: string | null;
+  score?: number | null;
+}
+
 export interface MethodsStructure {
   chunks?: AnalysisChunk[] | null;
   equations?: EquationCollection | null;
@@ -230,6 +245,7 @@ export interface QAResponse {
   sources: QASource[];
   answer_tiers?: AnswerTiers;
   equations?: EquationCollection | null;
+  tables?: TableArtifact[] | null;
 }
 
 export interface ChatMessage {
@@ -238,6 +254,7 @@ export interface ChatMessage {
   content: string;
   sources?: QASource[];
   equations?: EquationCollection | null;
+  tables?: TableArtifact[] | null;
   timestamp: number;
 }
 

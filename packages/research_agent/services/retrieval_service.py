@@ -12,6 +12,7 @@ from research_agent.tools.vector_store import (
     semantic_search,
     semantic_search_sections,
     semantic_search_subsections,
+    semantic_search_tables,
 )
 from research_agent.services.chunk_structure import (
     INTENT_ROLE_WEIGHTS,
@@ -44,6 +45,14 @@ REFERENCE_SECTION_NAMES = {
     "works cited",
     "cited works",
 }
+TABLE_QUERY_KEYWORDS = [
+    "table",
+    "tables",
+    "results table",
+    "result table",
+    "ablation table",
+    "benchmark table",
+]
 QUERY_INTENT_KEYWORDS = {
     "definition": ["what is", "define", "definition", "overview", "motivation", "problem"],
     "method": ["method", "approach", "algorithm", "pipeline", "implementation", "how"],
@@ -388,6 +397,11 @@ def classify_query(query: str) -> str:
     return best_type
 
 
+def is_table_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(keyword in lowered for keyword in TABLE_QUERY_KEYWORDS)
+
+
 def _section_prior(query_type: str, section_name: str | None) -> float:
     if not section_name:
         return 0.0
@@ -728,3 +742,43 @@ def retrieve_relevant_chunks(
         "filtered_chunks": selected_chunks,
         "retrieval_confidence": retrieval_confidence,
     }
+
+
+def retrieve_relevant_tables(
+    db: Session,
+    query: str,
+    *,
+    paper_id: uuid.UUID,
+    top_k: int = 4,
+) -> list[dict]:
+    query_embedding = generate_embedding(query, task="query")
+    table_results = semantic_search_tables(db, query_embedding, paper_id=paper_id, top_k=max(top_k * 3, 8))
+    lowered = query.lower()
+    label_match = re.search(r"\btable\s+(\d+)\b", lowered)
+    ranked = sorted(
+        table_results,
+        key=lambda table: (
+            float(table.get("score", 0.0))
+            + (0.45 if label_match and str(table.get("table_label") or "").lower() == f"table {label_match.group(1)}" else 0.0)
+            + (0.18 if table.get("table_type") == "results" and any(keyword in lowered for keyword in ("result", "benchmark", "metric")) else 0.0)
+            + (0.14 if table.get("table_type") == "ablation" and "ablation" in lowered else 0.0)
+            + (0.12 if table.get("caption") else 0.0),
+            len(str(table.get("normalized_table_text") or "")),
+        ),
+        reverse=True,
+    )
+    logger.info(
+        "qa_table_retrieval query=%s retrieved_tables=%s",
+        query,
+        [
+            {
+                "table_id": table.get("table_id"),
+                "label": table.get("table_label"),
+                "caption": str(table.get("caption") or "")[:180],
+                "type": table.get("table_type"),
+                "score": round(float(table.get("score", 0.0)), 4),
+            }
+            for table in ranked[:top_k]
+        ],
+    )
+    return ranked[:top_k]

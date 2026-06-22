@@ -16,7 +16,7 @@ from research_agent.agents.state.qa_state import (
     RetrievalParameters,
     VerificationReport,
 )
-from research_agent.services.retrieval_service import classify_query
+from research_agent.services.retrieval_service import classify_query, is_table_query, retrieve_relevant_tables
 from research_agent.services.paper_analysis_service import get_extracted_method_equations
 from research_agent.tools.embedder import get_tokenizer
 from research_agent.tools.gemini_client import generate_json
@@ -116,6 +116,12 @@ FORMULA_QUERY_EXPANSION_TERMS = (
     "mathematical formulation",
     "objective",
     "notation",
+)
+TABLE_QUERY_EXPANSION_TERMS = (
+    "table",
+    "caption",
+    "results",
+    "metrics",
 )
 
 FOLLOW_UP_STARTERS = (
@@ -277,6 +283,8 @@ def _allows_general_background(query: str, diagnostics: EvidenceDiagnostics) -> 
 def _response_mode(query: str) -> str:
     if _is_formula_query(query):
         return "equation_extraction"
+    if is_table_query(query):
+        return "table_extraction"
     lowered = query.lower()
     if any(marker in lowered for marker in ["list", "show", "provide", "give me", "which are", "what are"]):
         return "literal_extraction"
@@ -289,6 +297,17 @@ def _expand_formula_query(query: str) -> str:
         return cleaned
     lowered = cleaned.lower()
     expansion_terms = [term for term in FORMULA_QUERY_EXPANSION_TERMS if term not in lowered]
+    if not expansion_terms:
+        return cleaned
+    return f"{cleaned} | focus on {'; '.join(expansion_terms[:4])}"
+
+
+def _expand_table_query(query: str) -> str:
+    cleaned = " ".join(query.split()).strip()
+    if not cleaned or not is_table_query(cleaned):
+        return cleaned
+    lowered = cleaned.lower()
+    expansion_terms = [term for term in TABLE_QUERY_EXPANSION_TERMS if term not in lowered]
     if not expansion_terms:
         return cleaned
     return f"{cleaned} | focus on {'; '.join(expansion_terms[:4])}"
@@ -384,9 +403,12 @@ def analyze_query_step(state: dict) -> dict:
     resolution = resolve_conversational_query(query, recent_turns)
     complexity_score, complexity_label = _estimate_query_complexity(query)
     formula_mode = _is_formula_query(query) or _is_formula_query(str(resolution.get("rewritten_query") or query))
+    table_mode = is_table_query(query) or is_table_query(str(resolution.get("rewritten_query") or query))
     active_query = str(resolution.get("rewritten_query") or query).strip() or query
     if formula_mode:
         active_query = _expand_formula_query(active_query)
+    if table_mode:
+        active_query = _expand_table_query(active_query)
     query_type = classify_query(active_query)
     orchestration_level = 1
     if complexity_score >= 3:
@@ -417,6 +439,7 @@ def analyze_query_step(state: dict) -> dict:
         "disable_subsection_filter": formula_mode,
         "expanded_scope": False,
         "formula_mode": formula_mode,
+        "table_mode": table_mode,
     }
 
     logger.info(
@@ -434,6 +457,7 @@ def analyze_query_step(state: dict) -> dict:
         "active_query": active_query,
         "query_type": query_type,
         "formula_mode": formula_mode,
+        "table_mode": table_mode,
         "recent_turns": recent_turns,
         "query_analysis": query_analysis,
         "orchestration_level": orchestration_level,
@@ -937,6 +961,46 @@ def _answer_entries_look_like_equations(entries: list[str]) -> bool:
     return equation_like >= max(1, len(entries) // 2)
 
 
+def _normalize_table_payloads(tables: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for table in tables:
+        normalized.append(
+            {
+                "table_id": table.get("table_id"),
+                "table_label": table.get("table_label"),
+                "caption": table.get("caption"),
+                "section_name": table.get("section_name"),
+                "subsection_name": table.get("subsection_name"),
+                "page_number": table.get("page_number"),
+                "table_type": table.get("table_type"),
+                "metric_names": list(table.get("metric_names") or []),
+                "dataset_names": list(table.get("dataset_names") or []),
+                "model_names": list(table.get("model_names") or []),
+                "normalized_table_text": str(table.get("normalized_table_text") or ""),
+                "score": float(table.get("score", 0.0)),
+            }
+        )
+    return normalized
+
+
+def _render_table_context(tables: list[dict]) -> str:
+    if not tables:
+        return ""
+    parts: list[str] = ["Structured tables extracted from the paper:"]
+    for table in tables[:3]:
+        header = table.get("table_label") or "Table"
+        caption = str(table.get("caption") or "").strip()
+        table_type = str(table.get("table_type") or "").strip()
+        body = str(table.get("normalized_table_text") or "").strip()
+        body_lines = [line.strip() for line in body.splitlines() if line.strip()]
+        snippet = "\n".join(body_lines[:6])
+        label = f"{header}: {caption}" if caption else str(header)
+        if table_type:
+            label += f" [{table_type}]"
+        parts.append(f"- {label}\n{snippet}")
+    return "\n\n".join(parts)
+
+
 def _render_equation_context(equation_collection: Mapping[str, object] | None) -> str:
     preferred_items = _preferred_equation_items(equation_collection, limit=5)
     if not preferred_items:
@@ -1005,9 +1069,23 @@ def generate_grounded_answer_step(state: dict) -> dict:
     )
     preferred_equations = _preferred_equation_items(equation_collection, limit=5)
     equation_context = _render_equation_context({"items": preferred_equations})
+    table_payloads = (
+        retrieve_relevant_tables(
+            state.get("db"),
+            state.get("active_query") or state.get("query"),
+            paper_id=state.get("paper_id"),
+            top_k=3,
+        )
+        if state.get("table_mode")
+        else []
+    )
+    normalized_tables = _normalize_table_payloads(table_payloads)
+    table_context = _render_table_context(normalized_tables)
     combined_context = context
     if equation_context:
         combined_context = f"{equation_context}\n\n{context}".strip()
+    if table_context:
+        combined_context = f"{table_context}\n\n{combined_context}".strip()
     required_evidence = list((state.get("execution_plan") or {}).get("required_evidence", []))
     allow_general_background = _allows_general_background(state["query"], diagnostics)
     response_mode = _response_mode(state["query"])
@@ -1147,6 +1225,7 @@ def generate_grounded_answer_step(state: dict) -> dict:
             if preferred_equations
             else (equation_collection or {"source": None, "items": []})
         ),
+        "tables": normalized_tables,
         "grounded_claims": grounded_claims,
         "final_confidence": final_confidence,
         "sources": sources,

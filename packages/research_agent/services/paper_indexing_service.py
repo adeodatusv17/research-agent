@@ -10,6 +10,7 @@ from research_agent.domain.models.paper_chunk import PaperChunk
 from research_agent.domain.models.paper_repository import PaperRepository
 from research_agent.domain.models.paper_section import PaperSection
 from research_agent.domain.models.paper_subsection import PaperSubsection
+from research_agent.domain.models.paper_table import PaperTable
 from research_agent.domain.models.reproducibility_score import ReproducibilityScore
 from research_agent.services.chunk_structure import prepare_chunks_for_indexing
 from research_agent.services.chunking_service import split_sections_into_chunks
@@ -19,12 +20,13 @@ from research_agent.services.section_parser_service import (
     build_subsection_index_entries,
     parse_sections,
 )
+from research_agent.services.table_extraction_service import extract_table_artifacts
 from research_agent.tools.embedder import (
     generate_embeddings,
     get_embedding_model_name,
     normalize_texts_for_embedding,
 )
-from research_agent.tools.vector_store import store_chunks, store_sections, store_subsections
+from research_agent.tools.vector_store import store_chunks, store_sections, store_subsections, store_tables
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,7 @@ def reset_paper_indices(db: Session, paper_id: uuid.UUID) -> None:
     db.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper_id))
     db.execute(delete(PaperSection).where(PaperSection.paper_id == paper_id))
     db.execute(delete(PaperSubsection).where(PaperSubsection.paper_id == paper_id))
+    db.execute(delete(PaperTable).where(PaperTable.paper_id == paper_id))
     db.execute(delete(PaperAnalysis).where(PaperAnalysis.paper_id == paper_id))
     db.execute(delete(PaperRepository).where(PaperRepository.paper_id == paper_id))
     db.execute(delete(ReproducibilityScore).where(ReproducibilityScore.paper_id == paper_id))
@@ -49,6 +52,7 @@ def index_paper_document(
     section_segments = parse_sections(document)
     indexed_sections = build_section_index_entries(section_segments)
     indexed_subsections = build_subsection_index_entries(section_segments)
+    indexed_tables = extract_table_artifacts(document, section_segments)
 
     section_embedding_texts, section_token_counts = (
         normalize_texts_for_embedding([str(section["content"]) for section in indexed_sections])
@@ -65,6 +69,14 @@ def index_paper_document(
     )
     for subsection, token_count in zip(indexed_subsections, subsection_token_counts, strict=False):
         subsection["token_count"] = token_count
+
+    table_embedding_texts, table_token_counts = (
+        normalize_texts_for_embedding([str(table["normalized_table_text"]) for table in indexed_tables])
+        if indexed_tables
+        else ([], [])
+    )
+    for table, token_count in zip(indexed_tables, table_token_counts, strict=False):
+        table["token_count"] = token_count
 
     raw_chunks = split_sections_into_chunks(section_segments)
     chunks = prepare_chunks_for_indexing(raw_chunks)
@@ -87,16 +99,19 @@ def index_paper_document(
     chunk_embeddings = generate_embeddings([str(chunk["content"]) for chunk in chunks]) if chunks else []
     section_embeddings = generate_embeddings(section_embedding_texts) if indexed_sections else []
     subsection_embeddings = generate_embeddings(subsection_embedding_texts) if indexed_subsections else []
+    table_embeddings = generate_embeddings(table_embedding_texts) if indexed_tables else []
 
     store_sections(db, paper.id, indexed_sections, section_embeddings)
     store_subsections(db, paper.id, indexed_subsections, subsection_embeddings)
     store_chunks(db, paper.id, chunks, chunk_embeddings)
+    store_tables(db, paper.id, indexed_tables, table_embeddings)
 
     logger.info(
-        "paper_indexing_complete paper_id=%s sections=%s subsections=%s raw_chunks=%s kept_chunks=%s max_chunk_tokens=%s domain=%s domain_confidence=%s embedding_model=%s replace_existing=%s",
+        "paper_indexing_complete paper_id=%s sections=%s subsections=%s tables=%s raw_chunks=%s kept_chunks=%s max_chunk_tokens=%s domain=%s domain_confidence=%s embedding_model=%s replace_existing=%s",
         paper.id,
         len(indexed_sections),
         len(indexed_subsections),
+        len(indexed_tables),
         len(raw_chunks),
         len(chunks),
         max_chunk_tokens,
@@ -110,6 +125,7 @@ def index_paper_document(
         "section_segments": section_segments,
         "indexed_sections": indexed_sections,
         "indexed_subsections": indexed_subsections,
+        "indexed_tables": indexed_tables,
         "raw_chunks": raw_chunks,
         "chunks": chunks,
         "max_chunk_tokens": max_chunk_tokens,
