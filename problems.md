@@ -269,6 +269,141 @@ This file tracks notable problems encountered during the project, along with obs
   - the QA UI remains readable for normal prose answers
   - source citations remain intact and do not break math layout
 
+## 2026-06-01
+
+### Priority track: chunk-level math retrieval, first-class table artifacts, and structured QA rendering
+
+- Goal:
+  - preserve the current hierarchical retrieval stack
+  - improve weak formula/table behavior incrementally
+  - add evaluation coverage before larger retrieval changes
+
+### Issue 4: chunk-level mathematical retrieval is still weaker than formula-mode answer rescue
+
+- Observed failure:
+  - formula answers for papers like LoRA are now correct at the user-facing level, but raw chunk retrieval still frequently surfaces:
+    - hyperparameter rows
+    - appendix-style math fragments
+    - table-adjacent symbol snippets
+- Findings:
+  - the canonical LoRA equations are recoverable from section-level extracted equation text
+  - raw and reranked chunk top-20 still do not reliably elevate the canonical formula chunk itself
+  - formula-mode currently succeeds because the answer path prefers cleaned extracted equations, not because chunk retrieval is fully fixed
+- Root cause:
+  - chunk-level searchable math evidence is still noisy
+  - chunk content and chunk ranking are not yet strong enough to guarantee canonical formula retrieval on their own
+- Low-risk next fixes:
+  - add equation/math metadata during ingestion for chunks:
+    - `contains_equation`
+    - `contains_latex_like_math`
+    - `math_density`
+    - `equation_type` when inferable (`objective`, `definition`, `derivation`, `constraint`)
+  - use those metadata signals only in formula-mode retrieval and reranking
+  - validate that canonical formulations are present in the final selected evidence for papers like LoRA
+- Risks:
+  - broadening these boosts beyond formula-mode could distort normal retrieval
+  - treating all symbol-heavy chunks as valuable would reintroduce hyperparameter/table noise
+- Acceptance criteria:
+  - canonical mathematical formulations are present in final evidence for formula queries when the paper contains them
+  - non-formula retrieval remains unchanged in quality
+
+### Issue 5: tables are not first-class retrievable artifacts
+
+- Current behavior:
+  - table-like blocks are detected in PDF parsing and rewritten as `TABLE:` text
+  - those blocks are chunked and sanitized into ordinary `PaperChunk` rows
+  - no separate table artifact, table metadata store, or direct table retrieval path exists
+- Observed failures:
+  - questions like:
+    - `Are there any tables in the paper?`
+    - `Show me the results table.`
+    - `What does Table 3 contain?`
+    can still return weak evidence or `Insufficient grounded evidence` even when the document contains tables
+  - captions, headers, and metric rows can be split across multiple neighboring chunks
+  - table-heavy chunks are often partially penalized as noisy evidence
+- Root causes:
+  - tables are treated as special text, not as first-class content objects
+  - there is no persistent table metadata such as:
+    - caption
+    - table label/number
+    - page number
+    - section/subsection
+    - detected table type (`results`, `ablation`, `hyperparameter`, `architecture`)
+    - detected metric names / dataset names / model names
+  - table questions currently depend on chunk retrieval plus sanitization heuristics
+- Chosen direction:
+  - prioritize first-class table storage with metadata over summary-only table handling
+- Low-risk proposed implementation:
+  - parse and store table artifacts separately from normal chunks
+  - minimally store:
+    - `paper_id`
+    - `table_id`
+    - `table_label`
+    - `caption`
+    - `section_name`
+    - `subsection_name`
+    - `page_number`
+    - `raw_table_text`
+    - `normalized_table_text`
+    - `table_type`
+    - `metric_names`
+    - `dataset_names`
+    - `model_names`
+  - embed normalized table text separately
+  - add a parallel table retrieval path for table/result-oriented QA
+  - keep linkages to nearby chunk ids so caption + explanation can be rejoined in QA
+- What should not be done first:
+  - do not start with table summaries alone
+  - do not replace chunk retrieval with table-only retrieval
+  - do not redesign the whole ingestion pipeline around a document parser swap in this pass
+- Acceptance criteria:
+  - LoRA and similar papers expose actual table artifacts during retrieval
+  - `Table 3` / `results table` / `are there any tables` questions return table-backed evidence instead of generic chunk fallback
+  - table retrieval is additive and does not harm non-table QA
+
+### Issue 6: table and formula rendering should be structured, not flattened
+
+- Observed failure:
+  - even when the right equation or table evidence exists, the UI can flatten it into text that is harder to scan
+- Root causes:
+  - formula rendering is improved, but still partly text-oriented
+  - tables do not yet have a dedicated presentation model
+- Planned low-risk UI changes:
+  - render formula answers as structured math blocks where possible
+  - render retrieved tables as explicit table cards with:
+    - caption
+    - table label
+    - rows/columns or compact normalized text
+    - optional nearby explanatory text
+- Acceptance criteria:
+  - equations appear as clearly separated math content
+  - tables appear as structured result artifacts instead of flattened prose blobs
+
+### Small generalized evaluation set
+
+- We need a reusable cross-paper QA evaluation set covering:
+  - general paper understanding
+  - conversational follow-ups
+  - formula queries
+  - table queries
+  - result/evidence lookup
+- Planned artifact:
+  - maintain a compact hand-authored evaluation file under `docs/` so future retrieval changes can be checked before and after implementation
+
+### Table extraction needed a stricter shape filter
+
+- Symptom:
+  - after first wiring first-class table storage, some caption-adjacent prose blocks were being mistaken for table artifacts
+  - other PDFs produced duplicate table artifacts for the same label/page when the same table text was repeated by the parser
+- Observed cause:
+  - PDF text extraction can flatten table rows into short line fragments that look different from normal prose
+  - a naive "caption nearby" check is not enough on its own
+- Mitigation:
+  - gate table extraction on row-like block shape, not just nearby captions
+  - deduplicate exact repeated `(table_label, page_number, normalized_table_text)` signatures before storing
+- Follow-up:
+  - keep using LoRA and Conformer as the concrete sanity-check papers for table retrieval
+
 ### Implementation plan
 
 - Phase 1: document and instrument
